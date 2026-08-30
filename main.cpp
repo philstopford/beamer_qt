@@ -145,7 +145,7 @@ public:
         connect(pair, &QPushButton::clicked, this, [this] {
             const int row = deviceList->currentRow();
             if (row < 0 || row >= found.size() || found[row].kind != DeviceKind::AppleTV) { statusBar()->showMessage(tr("This device does not require application pairing")); return; }
-            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/airfry/rust/target/debug/airfry"));
+            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
             if (QFileInfo::exists(airfry)) {
                 auto *pairing = new QProcess(this);
                 connect(pairing, &QProcess::readyReadStandardError, this, [this, pairing] { const auto s = QString::fromLocal8Bit(pairing->readAllStandardError()).trimmed(); if (!s.isEmpty()) statusBar()->showMessage(s.split('\n').last()); });
@@ -263,7 +263,7 @@ private:
 
     void checkPairStatus(int row) {
         if (row < 0 || row >= found.size()) return;
-        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/airfry/rust/target/debug/airfry"));
+        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
         if (!QFileInfo::exists(airfry)) return;
         auto *check = new QProcess(this);
         connect(check, &QProcess::finished, this, [this, check, row](int, QProcess::ExitStatus) {
@@ -281,7 +281,7 @@ private:
     }
 
     void scanAppleTvs() {
-        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/airfry/rust/target/debug/airfry"));
+        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
         if (QFileInfo::exists(airfry)) {
             auto *scan = new QProcess(this);
             connect(scan, &QProcess::finished, this, [this, scan](int code, QProcess::ExitStatus) {
@@ -344,7 +344,7 @@ private:
         if (row < 0 || row >= found.size()) return;
         const auto &device = found.at(row);
         if (device.kind != DeviceKind::Chromecast) {
-            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/airfry/rust/target/debug/airfry"));
+            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
             if (QFileInfo::exists(airfry)) {
                 if (!process) process = new QProcess(this);
                 connect(process, &QProcess::readyReadStandardError, this, [this] {
@@ -379,7 +379,7 @@ private:
         }
         if (!process) process = new QProcess(this);
         const auto url = server->mediaUrl(device.address).toString();
-        const auto nativeCast = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/chromecast/target/debug/beamer-chromecast"));
+        const auto nativeCast = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
         const auto executable = QFileInfo::exists(nativeCast) ? nativeCast : QStringLiteral("catt");
         const auto args = executable == nativeCast ? QStringList{"cast", device.address.toString(), url} : QStringList{"-d", device.address.toString(), "cast", url};
         process->start(executable, args);

@@ -18,6 +18,19 @@ add_test(NAME device_parser COMMAND test_device)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/backends")
 configure_file(backends/pyatv_bridge.py "${CMAKE_CURRENT_BINARY_DIR}/backends/pyatv_bridge.py" COPYONLY)
 
+add_custom_target(native_backends ALL
+    COMMAND cargo build --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/third_party/airfry/rust/Cargo.toml" --bin airfry --offline
+    COMMAND cargo build --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/third_party/chromecast/Cargo.toml" --bin beamer-chromecast --offline
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/airfry/rust/target/debug/airfry"
+        "${CMAKE_CURRENT_BINARY_DIR}/backends/airfry"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/chromecast/target/debug/beamer-chromecast"
+        "${CMAKE_CURRENT_BINARY_DIR}/backends/beamer-chromecast"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Building native AirPlay and Chromecast backends"
+)
+
 set_target_properties(beamer_qt PROPERTIES
     WIN32_EXECUTABLE TRUE
     MACOSX_BUNDLE TRUE

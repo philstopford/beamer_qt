@@ -31,13 +31,12 @@ ctest --test-dir build --output-on-failure
 ## Run
 
 ```bash
-BEAMER_AIRFRY="$PWD/third_party/airfry/rust/target/debug/airfry" \
 ./build/beamer_qt
 ```
 
 The native Chromecast helper is expected at `third_party/chromecast/target/debug/beamer-chromecast`. Override it with `BEAMER_CHROMECAST` if it is elsewhere.
 
-Drag a video into the window, select a receiver, and click Beam. For the first Apple TV use, click Pair, wait for the PIN screen, and enter the PIN. Pairing credentials are saved by AirFry.
+The normal CMake build places both native backends beside the executable, so no environment variables are required. Drag a video into the window, select a receiver, and click Beam. For the first Apple TV use, click Pair, wait for the PIN screen, and enter the PIN. Pairing credentials are saved by AirFry.
 
 The computer and receiver must be on reachable LANs. mDNS/SSDP and receiver return connections must not be blocked by the firewall.
 
