@@ -52,6 +52,8 @@ fn main() {
     let code = match cmd {
         "daemon" | "--daemonize" => cmd_daemon(&args),
         "tray" => tray::run_tray(),
+        "discover-json" => cmd_discover_json(),
+        "credentials-check" => cmd_credentials_check(&args),
         "discover" | "scan" => cmd_discover(&args),
         "pair" => cmd_pair(&args),
         "mirror" => cmd_mirror(&args),
@@ -105,6 +107,20 @@ fn print_help() {
            --socket <path>        Unix socket path for the daemon control interface",
         ver = env!("CARGO_PKG_VERSION")
     );
+}
+
+fn cmd_discover_json() -> i32 {
+    match discovery::discover(Duration::from_secs(5)) {
+        Ok(devices) => { println!("{}", serde_json::to_string(&devices.iter().map(|d| serde_json::json!({"id": d.device_id, "name": d.name, "address": d.ip, "port": d.port})).collect::<Vec<_>>()).unwrap()); 0 }
+        Err(e) => { eprintln!("discovery failed: {e:#}"); 1 }
+    }
+}
+
+fn cmd_credentials_check(args: &[String]) -> i32 {
+    let Some(id) = args.get(2) else { eprintln!("usage: airfry credentials-check <device-id>"); return 2; };
+    let store = credentials::CredentialStore::open_default();
+    println!("{}", if store.lookup(id).is_some() { "paired" } else { "needs_pairing" });
+    0
 }
 
 /// Parsed flags common to the `mirror` (and partly `pair`) subcommands, in the

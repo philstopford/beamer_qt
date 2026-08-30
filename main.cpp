@@ -93,6 +93,7 @@ public:
         auto *deviceLayout = new QVBoxLayout(devices);
         auto *deviceToolbar = new QHBoxLayout;
         pair = new QPushButton(tr("Pair…"), devices);
+        pair->setVisible(false);
         deviceToolbar->addWidget(new QLabel(tr("Target:"), devices));
         deviceToolbar->addStretch(); deviceToolbar->addWidget(pair);
         deviceLayout->addLayout(deviceToolbar);
@@ -124,6 +125,7 @@ public:
         connect(deviceList, &QListWidget::currentRowChanged, this, [this](int row) {
             const bool ready = row >= 0 && row < found.size() && !selectedPath.isEmpty();
             play->setEnabled(ready); pause->setEnabled(ready); stop->setEnabled(ready); pair->setEnabled(row >= 0 && row < found.size());
+            if (row >= 0 && row < found.size()) checkPairStatus(row);
         });
         connect(play, &QPushButton::clicked, this, [this] { beam(); });
         connect(stop, &QPushButton::clicked, this, [this] { if (process) process->kill(); });
@@ -234,7 +236,7 @@ private:
                     bool duplicate = false; for (const auto &d : found) duplicate |= d.id == device.id;
                     if (!duplicate) {
                         if (found.isEmpty()) deviceList->clear();
-                        found.append(device); deviceList->addItem(device.name);
+                        found.append(device); addDeviceRow(device);
                     }
                 }
             }
@@ -248,7 +250,51 @@ private:
             else statusBar()->showMessage(tr("Found %1 receiver(s)").arg(found.size()));
         });
     }
+    void addDeviceRow(const Device &device) {
+        auto *item = new QListWidgetItem(deviceList); item->setSizeHint(QSize(0, 36));
+        auto *row = new QWidget(deviceList); auto *layout = new QHBoxLayout(row); layout->setContentsMargins(8, 0, 8, 0);
+        layout->addWidget(new QLabel(device.name, row), 1);
+        auto *action = new QPushButton(tr("Pair"), row); action->setVisible(device.kind == DeviceKind::AppleTV); layout->addWidget(action);
+        const int index = found.size() - 1;
+        connect(action, &QPushButton::clicked, this, [this, index] { deviceList->setCurrentRow(index); pair->click(); });
+        deviceList->setItemWidget(item, row);
+        if (device.kind == DeviceKind::AppleTV) QTimer::singleShot(0, this, [this, index] { checkPairStatus(index); });
+    }
+
+    void checkPairStatus(int row) {
+        if (row < 0 || row >= found.size()) return;
+        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/airfry/rust/target/debug/airfry"));
+        if (!QFileInfo::exists(airfry)) return;
+        auto *check = new QProcess(this);
+        connect(check, &QProcess::finished, this, [this, check, row](int, QProcess::ExitStatus) {
+            if (row < deviceList->count() && row < found.size()) {
+                const bool paired = QString::fromLocal8Bit(check->readAllStandardOutput()).trimmed() == "paired";
+                if (auto *container = deviceList->itemWidget(deviceList->item(row))) {
+                    const auto labels = container->findChildren<QLabel*>(); const auto buttons = container->findChildren<QPushButton*>();
+                    if (!labels.isEmpty()) labels.first()->setText(found[row].name + (paired ? tr("  (Paired)") : tr("  (Needs pairing)")));
+                    if (!buttons.isEmpty()) { buttons.first()->setEnabled(!paired); buttons.first()->setVisible(!paired); }
+                }
+            }
+            check->deleteLater();
+        });
+        check->start(airfry, {"credentials-check", found[row].address.toString()});
+    }
+
     void scanAppleTvs() {
+        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/airfry/rust/target/debug/airfry"));
+        if (QFileInfo::exists(airfry)) {
+            auto *scan = new QProcess(this);
+            connect(scan, &QProcess::finished, this, [this, scan](int code, QProcess::ExitStatus) {
+                if (code != 0) { statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(QString::fromLocal8Bit(scan->readAllStandardError()).trimmed())); scan->deleteLater(); return; }
+                for (const auto &value : QJsonDocument::fromJson(scan->readAllStandardOutput()).array()) {
+                    const auto object = value.toObject(); Device device; device.id = object.value("id").toString(); device.name = object.value("name").toString(); device.address = QHostAddress(object.value("address").toString()); device.kind = DeviceKind::AppleTV;
+                    bool duplicate = false; for (const auto &d : found) duplicate |= d.id == device.id;
+                    if (!duplicate) { if (found.isEmpty()) deviceList->clear(); found.append(device); addDeviceRow(device); }
+                }
+                scan->deleteLater();
+            });
+            scan->start(airfry, {"discover-json"}); return;
+        }
         const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
         if (!QFileInfo::exists(script)) return;
         auto *scan = new QProcess(this);
@@ -266,7 +312,7 @@ private:
                 bool duplicate = false; for (const auto &d : found) duplicate |= d.id == device.id;
                 if (!duplicate) {
                     if (found.isEmpty()) deviceList->clear();
-                    found.append(device); deviceList->addItem(device.name);
+                    found.append(device); addDeviceRow(device);
                 }
             }
             scan->deleteLater();
