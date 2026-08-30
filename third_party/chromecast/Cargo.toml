@@ -1,0 +1,8 @@
+[package]
+name = "beamer-chromecast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cast-sender = "0.3.0"
+smol = "2"

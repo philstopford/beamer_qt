@@ -24,3 +24,4 @@ CMakeUserPresets.json
 # Vendored AirFry generated output
 /third_party/airfry/rust/target/
 /third_party/airfry/rust/fpemu/fp_blob.bin
+/third_party/chromecast/target/

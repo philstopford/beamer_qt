@@ -379,8 +379,11 @@ private:
         }
         if (!process) process = new QProcess(this);
         const auto url = server->mediaUrl(device.address).toString();
-        process->start("catt", {"-d", device.address.toString(), "cast", url});
-        if (!process->waitForStarted(1000)) statusBar()->showMessage(tr("Chromecast backend unavailable: install catt"));
+        const auto nativeCast = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("../third_party/chromecast/target/debug/beamer-chromecast"));
+        const auto executable = QFileInfo::exists(nativeCast) ? nativeCast : QStringLiteral("catt");
+        const auto args = executable == nativeCast ? QStringList{"cast", device.address.toString(), url} : QStringList{"-d", device.address.toString(), "cast", url};
+        process->start(executable, args);
+        if (!process->waitForStarted(1000)) statusBar()->showMessage(tr("Chromecast backend unavailable: build beamer-chromecast"));
         else statusBar()->showMessage(tr("Sending video to %1…").arg(device.name));
     }
     QLabel *fileLabel{};
