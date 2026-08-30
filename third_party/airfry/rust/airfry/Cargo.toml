@@ -1,0 +1,70 @@
+[package]
+name = "airfry"
+version = "0.1.0"
+edition = "2021"
+description = "AirFry — a native Linux AirPlay screen-mirroring sender for Apple TV"
+license = "MIT"
+
+[[bin]]
+name = "airfry"
+path = "src/main.rs"
+
+[[bin]]
+name = "airfry-ctl"
+path = "src/bin/airfry-ctl.rs"
+
+[dependencies]
+fpemu = { path = "../fpemu" }
+mdns-sd = "0.11"
+anyhow = "1"
+
+# pairing / transport crypto
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
+# Original (Bernstein "djb") ChaCha20 with a 64-bit nonce + Poly1305, used to
+# build the audio RTP AEAD that matches github.com/aead/chacha20poly1305
+# NewCipher (8-byte nonce), NOT the IETF 12-byte variant above.
+chacha20 = "0.9"
+poly1305 = "0.8"
+
+# screen capture + H.264 encode
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+
+# binary plists for the mirror SETUP bodies
+plist = "1"
+
+# persistent pairing credential store (JSON file backend)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# system keyring credential backend (-cred-backend keyring): on Linux this uses
+# the freedesktop Secret Service (GNOME Keyring, KDE Wallet, KeePassXC, ...),
+# matching doubletake's go-keyring backend. crypto-rust keeps the encryption in
+# pure Rust so we don't need a system libdbus/OpenSSL at build time.
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+# XDG ScreenCast portal (Wayland) + a tiny runtime to drive its async API
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+# clean Ctrl-C / SIGTERM handling for the mirror run loop + graceful shutdown
+ctrlc = { version = "3", features = ["termination"] }
+
+# Native StatusNotifierItem system tray (pure Rust, zbus backend → renders in
+# the GNOME/AppIndicator DBusMenu style, no Qt/C++). Vendored + patched to
+# surface the menu-open (AboutToShow) event so we scan only when the menu opens.
+# async-io backend (not tokio): a self-contained executor whose blocking
+# block_on is safe to call concurrently from our worker threads (the tray's
+# redraw/update path), independent of ashpd's tokio runtime.
+ksni = { path = "../../third_party/ksni", default-features = false, features = ["blocking", "async-io"] }

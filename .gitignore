@@ -20,3 +20,7 @@ CMakeUserPresets.json
 /.idea
 /build
 /beamer_qt/.idea
+
+# Vendored AirFry generated output
+/third_party/airfry/rust/target/
+/third_party/airfry/rust/fpemu/fp_blob.bin

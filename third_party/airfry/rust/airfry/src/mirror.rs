@@ -1,0 +1,2554 @@
+//! AirPlay screen-mirroring pipeline — a faithful Rust port of doubletake's
+//! internal/airplay/mirror.go (video + audio paths).
+//!
+//! This drives an already-established `rtsp::Session` (paired + HAP-encrypted +
+//! FairPlay key derived) through the mirror SETUP/RECORD handshake, opens the
+//! receiver's video data TCP channel, and streams H.264 access units with the
+//! 128-byte mirror frame header and per-frame encryption that the receiver
+//! expects byte-for-byte.
+//!
+//! Wire-format / crypto invariants ported verbatim from mirror.go + client.go:
+//!
+//!   * Video SETUP carries shk/shiv (raw stream key/IV) inside the video stream
+//!     descriptor (type=110) plus root-level ekey/eiv (the 72-byte FairPlay
+//!     wrapped key). Audio SETUP (type=96) creates the session first.
+//!   * Cipher selection (mirror.go setupMirrorSession):
+//!       - encrypted pair-verify with a shared secret  -> ChaCha20-Poly1305
+//!         with an HKDF-SHA512 key (deriveChaChaKey): salt =
+//!         "DataStream-Salt"+dec(streamConnectionID), info =
+//!         "DataStream-Output-Encryption-Key", IKM = pair-verify shared secret.
+//!         Per-frame nonce = [0;4] || LE64(counter); AAD = the 128-byte header.
+//!       - otherwise (UxPlay, plaintext) -> AES-128-CTR with SHA-512-derived
+//!         key/IV (deriveVideoKeys) and the block-alignment scheme in
+//!         MirrorCipher (matches mirror_buffer_decrypt on the receiver).
+//!   * Frame header (128 bytes, little-endian): see `mirror_header`.
+//!   * NTP frame timestamps: boot-relative, no epoch, with a forward bias.
+//!
+//! Audio IS streamed (RTP / ALAC). The audio SETUP is sent first because
+//! current Apple receivers require the audio session to exist before they accept
+//! the video stream and RECORD (mirror.go comment).
+
+#![allow(dead_code)]
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use aes::cipher::{KeyIvInit, StreamCipher};
+use anyhow::{anyhow, bail, Context, Result};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::ChaCha20Poly1305;
+use hkdf::Hkdf;
+use sha2::{Digest, Sha512};
+
+use crate::audio::{self, AudioSecurityMode};
+use crate::broadcast::BroadcastSink;
+use crate::capture::{CaptureConfig, CaptureSource, LiveFit};
+use crate::latency;
+use crate::rtsp::{Session, Transport};
+
+type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+/// A source of the raw Annex-B / AVCC H.264 byte stream the mirror consumes.
+///
+/// Abstracts over an owned `capture::CaptureSource` (one mirror, one capture)
+/// and a `broadcast::BroadcastSink` (one shared `BroadcastCapture` fanned out to
+/// N mirrors — the daemon's multi-receiver case). Both already expose a
+/// `read(&mut [u8]) -> Result<usize>` with the same contract (fills `buf`,
+/// returns the byte count, 0 == end-of-stream), so the NAL parser / AU-assembly
+/// loop reads from `dyn FrameSource` and is agnostic to which one it is. This is
+/// the Rust analogue of Go's `*ScreenCapture` interface that both
+/// `ScreenCapture` and `BroadcastSink.AsCapture()` satisfy (daemon.go:691).
+pub trait FrameSource: Send {
+    /// Fill `buf` with the next chunk of the H.264 byte-stream. Returns the
+    /// number of bytes written, or 0 at end-of-stream.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+}
+
+impl FrameSource for CaptureSource {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        CaptureSource::read(self, buf)
+    }
+}
+
+impl FrameSource for BroadcastSink {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        BroadcastSink::read(self, buf)
+    }
+}
+
+/// Options for a mirror run.
+#[derive(Clone, Debug)]
+pub struct MirrorOpts {
+    pub test_audio: bool,
+    pub file: Option<String>,
+    pub fit_pct: u8,
+    pub bitrate_kbps: u32,
+    pub fps: u32,
+    pub force_software_encoder: bool,
+    /// Disable per-frame video encryption (matches cfg.NoEncrypt). For debug.
+    pub no_encrypt: bool,
+    /// Skip audio capture/streaming entirely (video-only mirror).
+    pub no_audio: bool,
+    /// Stream audio but tell the receiver to mute it (SET_PARAMETER volume
+    /// -144 dB). Audio frames are still sent. This is the *startup* mute; the
+    /// receiver can still be muted/unmuted at runtime via `MirrorControl`.
+    pub mute_audio: bool,
+    /// Use shk/shiv directly for the AES-CTR video cipher without the SHA-512
+    /// derivation (mirror.go cfg.DirectKey, mirror.go:577-580). Only affects the
+    /// AES-CTR (plaintext/UxPlay) path; the ChaCha20 path is unaffected.
+    pub direct_key: bool,
+    /// Local UDP/TCP port range `[min, max]` (inclusive) the receiver can reach
+    /// back on (audio timing/control/data UDP + the event TCP listener). When
+    /// `None`, OS-ephemeral ports are used. Matches doubletake's -port-range /
+    /// parsePortRange + the allocateConsecutiveUDPPortsInRange / listenTCPInRange
+    /// allocators. Falls back to ephemeral when the range is exhausted is NOT
+    /// done — like Go, an exhausted explicit range is a hard error.
+    pub port_range: Option<(u16, u16)>,
+    /// Use the synthetic videotestsrc pipeline instead of real screen capture
+    /// (main.go -test / capture.go StartTestCapture). Lets mirroring run with no
+    /// display/portal. Forwarded to `CaptureConfig.test`.
+    pub test: bool,
+    /// Keep the underscan stage live so `MirrorControl::set_underscan` can retune
+    /// it mid-stream (the tray sets this). Forwarded to `CaptureConfig.live_underscan`.
+    pub live_underscan: bool,
+}
+
+impl Default for MirrorOpts {
+    fn default() -> Self {
+        MirrorOpts {
+            test_audio: false,
+            file: None,
+            fit_pct: 0,
+            bitrate_kbps: 0,
+            fps: 30,
+            force_software_encoder: false,
+            no_encrypt: false,
+            no_audio: false,
+            mute_audio: false,
+            direct_key: false,
+            port_range: None,
+            test: false,
+            live_underscan: false,
+        }
+    }
+}
+
+/// parsePortRange (cmd/doubletake/main.go:22-48) — parse a `"MIN-MAX"` string
+/// into inclusive port bounds. An empty/whitespace string yields `None` ("let
+/// the OS pick"). Validates 1..=65535, min<=max, and at least 4 ports (3 UDP +
+/// 1 TCP), matching Go exactly.
+pub fn parse_port_range(s: &str) -> Result<Option<(u16, u16)>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let (lo_s, hi_s) = s
+        .split_once('-')
+        .ok_or_else(|| anyhow!("expected MIN-MAX, got {s:?}"))?;
+    let lo: i64 = lo_s
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("min: {e}"))?;
+    let hi: i64 = hi_s
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("max: {e}"))?;
+    if lo < 1 || hi > 65535 || lo > hi {
+        bail!("range {lo}-{hi} out of bounds (1-65535, min<=max)");
+    }
+    if hi - lo + 1 < 4 {
+        bail!("range {lo}-{hi} too small; need at least 4 ports (3 UDP + 1 TCP)");
+    }
+    Ok(Some((lo as u16, hi as u16)))
+}
+
+/// A shareable handle that lets an external controller (daemon/tray) drive a
+/// running mirror: stop it, and mute/unmute its audio at runtime. Construct one,
+/// pass it to `run_mirror_with_control`, and call `set_muted` from any thread.
+///
+/// The runtime mute is the analogue of mirror.go's `MirrorSession.SetAudioMuted`
+/// (mirror.go:1672-1688): it sends a SET_PARAMETER volume body on the control
+/// channel (`0.000000` unmuted, `-144.000000` muted). `run_mirror_with_control`
+/// populates the control transport + session URI once SETUP completes; before
+/// that, `set_muted` only records the desired state (applied at setup).
+#[derive(Clone)]
+pub struct MirrorControl {
+    stop: Arc<AtomicBool>,
+    /// Desired mute state. Seeded from `MirrorOpts.mute_audio` at setup and
+    /// updated by `set_muted`.
+    muted: Arc<AtomicBool>,
+    /// Set by run once the control channel + audio URI are ready. `None` until
+    /// then (or after teardown).
+    chan: Arc<Mutex<Option<MuteChannel>>>,
+    /// Live underscan handle, bound once the capture pipeline is up. `set_underscan`
+    /// applies through it; `None` until then (or after teardown), or when this
+    /// mirror was not started with `live_underscan`.
+    fit: Arc<Mutex<Option<LiveFit>>>,
+}
+
+struct MuteChannel {
+    control: Arc<Mutex<Transport>>,
+    audio_uri: String,
+}
+
+/// SET_PARAMETER volume body for the muted state (mirror.go:1681).
+const VOLUME_MUTED: &[u8] = b"volume: -144.000000\r\n";
+/// SET_PARAMETER volume body for the unmuted (max, 0 dB) state (mirror.go:1679).
+const VOLUME_UNMUTED: &[u8] = b"volume: 0.000000\r\n";
+
+impl MirrorControl {
+    /// Create a control with a fresh stop flag.
+    pub fn new() -> Self {
+        Self::with_stop(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Create a control wrapping a caller-owned stop flag.
+    pub fn with_stop(stop: Arc<AtomicBool>) -> Self {
+        MirrorControl {
+            stop,
+            muted: Arc::new(AtomicBool::new(false)),
+            chan: Arc::new(Mutex::new(None)),
+            fit: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The underlying stop flag (so the caller can also flip it directly).
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    /// Request the mirror to stop.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Current desired mute state.
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Mute/unmute the mirrored audio at runtime (mirror.go SetAudioMuted). When
+    /// the control channel is live this sends the SET_PARAMETER volume body
+    /// immediately; otherwise the state is recorded and applied at setup.
+    pub fn set_muted(&self, muted: bool) -> Result<()> {
+        self.muted.store(muted, Ordering::Relaxed);
+        let guard = self.chan.lock().unwrap();
+        if let Some(ch) = guard.as_ref() {
+            let body = if muted { VOLUME_MUTED } else { VOLUME_UNMUTED };
+            ch.control
+                .lock()
+                .unwrap()
+                .request("SET_PARAMETER", &ch.audio_uri, "text/parameters", body, &[])
+                .map_err(|e| anyhow!("set audio muted={muted}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Retune the underscan border LIVE on the running pipeline (0..=25 %). A
+    /// no-op if this mirror has no live fit stage (not started with
+    /// `live_underscan`, or torn down). No reconnect, no portal re-prompt.
+    pub fn set_underscan(&self, pct: u8) {
+        if let Some(lf) = self.fit.lock().unwrap().as_ref() {
+            lf.apply(pct);
+        }
+    }
+
+    /// True if this control can adjust underscan live right now.
+    pub fn has_live_underscan(&self) -> bool {
+        self.fit.lock().unwrap().is_some()
+    }
+
+    fn bind(&self, control: Arc<Mutex<Transport>>, audio_uri: String) {
+        *self.chan.lock().unwrap() = Some(MuteChannel { control, audio_uri });
+    }
+
+    fn bind_fit(&self, lf: LiveFit) {
+        *self.fit.lock().unwrap() = Some(lf);
+    }
+
+    fn unbind(&self) {
+        *self.chan.lock().unwrap() = None;
+        *self.fit.lock().unwrap() = None;
+    }
+}
+
+impl Default for MirrorControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Boot-relative timestamp reference (mirror.go: appStartTime = time.Now()).
+fn boot_origin() -> Instant {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+const SECONDS_FROM_1900_TO_1970: u64 = 2208988800;
+
+/// videoTimestampBias — TargetLatency, floored at 5ms. Centralized in
+/// latency.rs (the single source of truth); with the default 1ms target this
+/// still yields 5ms, unchanged.
+fn video_timestamp_bias() -> Duration {
+    latency::video_timestamp_bias()
+}
+
+/// ntpTimeWithBias — 64-bit NTP fixed-point, boot-relative, no epoch, with bias.
+fn ntp_time_with_bias(bias: Duration) -> u64 {
+    let bias = if bias < Duration::from_millis(5) {
+        Duration::from_millis(5)
+    } else {
+        bias
+    };
+    let d = boot_origin().elapsed() + bias;
+    let sec = d.as_secs();
+    let nsec_frac = d.subsec_nanos() as u64;
+    let frac = (nsec_frac << 32) / 1_000_000_000u64;
+    (sec << 32) | frac
+}
+
+/// ntpBootTimestamp — boot-relative time with the NTP epoch added, used in the
+/// NTP timing responder replies.
+fn ntp_boot_timestamp() -> u64 {
+    let d = boot_origin().elapsed();
+    let sec = d.as_secs() + SECONDS_FROM_1900_TO_1970;
+    let nsec_frac = d.subsec_nanos() as u64;
+    let frac = (nsec_frac << 32) / 1_000_000_000u64;
+    (sec << 32) | frac
+}
+
+// ---------------------------------------------------------------------------
+// Key derivation (mirror.go deriveVideoKeys / deriveChaChaKey)
+// ---------------------------------------------------------------------------
+
+/// deriveVideoKeys — AES-128-CTR key/IV: SHA-512("AirPlayStreamKey<id>" + shk)[:16]
+/// and SHA-512("AirPlayStreamIV<id>" + shk)[:16]. `id` is the stream
+/// connection id formatted as an unsigned decimal (Go uses uint64).
+fn derive_video_keys(shk: &[u8], stream_connection_id: i64) -> ([u8; 16], [u8; 16]) {
+    let id = stream_connection_id as u64;
+
+    let mut h = Sha512::new();
+    h.update(format!("AirPlayStreamKey{id}").as_bytes());
+    h.update(shk);
+    let key_full = h.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&key_full[..16]);
+
+    let mut h = Sha512::new();
+    h.update(format!("AirPlayStreamIV{id}").as_bytes());
+    h.update(shk);
+    let iv_full = h.finalize();
+    let mut iv = [0u8; 16];
+    iv.copy_from_slice(&iv_full[..16]);
+
+    (key, iv)
+}
+
+/// deriveChaChaKey — HKDF-SHA512, IKM = pair-verify shared secret,
+/// salt = "DataStream-Salt"+dec(id), info = "DataStream-Output-Encryption-Key".
+fn derive_chacha_key(ikm: &[u8], stream_connection_id: i64) -> Result<[u8; 32]> {
+    let id = stream_connection_id as u64;
+    let salt = format!("DataStream-Salt{id}");
+    let info = b"DataStream-Output-Encryption-Key";
+
+    let hk = Hkdf::<Sha512>::new(Some(salt.as_bytes()), ikm);
+    let mut out = [0u8; 32];
+    hk.expand(info, &mut out)
+        .map_err(|_| anyhow!("hkdf expand"))?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// AES-CTR mirror cipher (client.go mirrorCipher / EncryptFrame)
+// ---------------------------------------------------------------------------
+
+/// The receiver's mirror_buffer_decrypt block-alignment scheme. The sender must
+/// produce ciphertext that decrypts correctly under it. Faithful port of
+/// client.go's mirrorCipher.EncryptFrame.
+struct MirrorCipher {
+    stream: Aes128Ctr,
+    block_offset: usize,
+    og: [u8; 16],
+    next_crypt_count: usize,
+}
+
+impl MirrorCipher {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> MirrorCipher {
+        MirrorCipher {
+            stream: Aes128Ctr::new(key.into(), iv.into()),
+            block_offset: 0,
+            og: [0u8; 16],
+            next_crypt_count: 0,
+        }
+    }
+
+    fn encrypt_frame(&mut self, payload: &[u8]) -> Vec<u8> {
+        let input_len = payload.len();
+        let mut out = vec![0u8; input_len];
+        let mut pos = 0usize;
+
+        // Step 1: XOR prefix bytes using cached keystream from previous frame's
+        // trailing partial block.
+        if self.next_crypt_count > 0 {
+            let mut n = self.next_crypt_count;
+            if n > input_len {
+                n = input_len;
+            }
+            let og_start = 16 - self.next_crypt_count;
+            for i in 0..n {
+                out[i] = payload[i] ^ self.og[og_start + i];
+            }
+            pos = n;
+        }
+
+        // Step 2: Advance CTR to next 16-byte boundary.
+        if self.block_offset > 0 {
+            let mut waste = vec![0u8; 16 - self.block_offset];
+            self.stream.apply_keystream(&mut waste);
+            self.block_offset = 0;
+        }
+
+        let remaining = input_len - pos;
+
+        // Step 3: Encrypt full 16-byte blocks.
+        let full_blocks = (remaining / 16) * 16;
+        if full_blocks > 0 {
+            out[pos..pos + full_blocks].copy_from_slice(&payload[pos..pos + full_blocks]);
+            self.stream.apply_keystream(&mut out[pos..pos + full_blocks]);
+            self.block_offset = 0;
+            pos += full_blocks;
+        }
+
+        // Step 4: Handle trailing partial block.
+        let rest_len = remaining % 16;
+        self.next_crypt_count = 0;
+        if rest_len > 0 {
+            let mut padded = [0u8; 16];
+            padded[..rest_len].copy_from_slice(&payload[pos..pos + rest_len]);
+            self.stream.apply_keystream(&mut padded);
+            out[pos..pos + rest_len].copy_from_slice(&padded[..rest_len]);
+            // Cache the full block for next frame's step 1.
+            self.og = padded;
+            self.next_crypt_count = 16 - rest_len;
+            self.block_offset = 0;
+        }
+
+        out
+    }
+}
+
+/// The selected per-frame video cipher.
+enum VideoCipher {
+    None,
+    AesCtr(MirrorCipher),
+    /// ChaCha20-Poly1305 with a monotonic 64-bit nonce counter; header is AAD.
+    ChaCha { aead: ChaCha20Poly1305, nonce: u64 },
+}
+
+impl VideoCipher {
+    /// Poly1305 tag overhead for the ChaCha path (mirror.go adds this to the
+    /// header's payload-size field). 0 for AES-CTR / none.
+    fn overhead(&self) -> usize {
+        match self {
+            VideoCipher::ChaCha { .. } => 16,
+            _ => 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H.264 NAL parser (mirror.go h264Parser) + AU helpers
+// ---------------------------------------------------------------------------
+
+struct H264Parser {
+    buf: Vec<u8>,
+}
+
+impl H264Parser {
+    fn new() -> H264Parser {
+        H264Parser {
+            buf: Vec::with_capacity(512 * 1024),
+        }
+    }
+
+    /// Push raw bytes, return any complete NAL units. Each returned NAL begins
+    /// with a 4-byte start code (00 00 00 01 for Annex-B; a synthetic
+    /// 00 00 00 01 for AVCC, matching pushAVCC which rewrites the length to 1).
+    fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        self.buf.extend_from_slice(data);
+        if has_start_code(&self.buf) {
+            self.push_annex_b()
+        } else {
+            self.push_avcc()
+        }
+    }
+
+    fn push_annex_b(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let start = match find_start_code(&self.buf, 0) {
+                Some(s) => s,
+                None => {
+                    if self.buf.len() > 1024 * 1024 {
+                        let keep = self.buf.len() - 128 * 1024;
+                        self.buf.drain(..keep);
+                    }
+                    break;
+                }
+            };
+            let next = match find_start_code(&self.buf, start + 3) {
+                Some(n) => n,
+                None => {
+                    if start > 0 {
+                        self.buf.drain(..start);
+                    }
+                    break;
+                }
+            };
+            out.push(self.buf[start..next].to_vec());
+            self.buf.drain(..next);
+        }
+        out
+    }
+
+    fn push_avcc(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            if self.buf.len() < 4 {
+                break;
+            }
+            let nal_len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+                as usize;
+            if nal_len == 0 || nal_len > 16 * 1024 * 1024 {
+                self.buf.clear();
+                break;
+            }
+            if self.buf.len() < 4 + nal_len {
+                break;
+            }
+            let mut nal = Vec::with_capacity(4 + nal_len);
+            nal.extend_from_slice(&1u32.to_be_bytes());
+            nal.extend_from_slice(&self.buf[4..4 + nal_len]);
+            out.push(nal);
+            self.buf.drain(..4 + nal_len);
+        }
+        out
+    }
+}
+
+fn has_start_code(b: &[u8]) -> bool {
+    find_start_code(b, 0).is_some()
+}
+
+fn find_start_code(b: &[u8], from: usize) -> Option<usize> {
+    let from = from.min(b.len());
+    let mut i = from;
+    while i + 3 < b.len() {
+        if b[i] == 0x00 && b[i + 1] == 0x00 {
+            if b[i + 2] == 0x01 {
+                return Some(i);
+            }
+            if i + 3 < b.len() && b[i + 2] == 0x00 && b[i + 3] == 0x01 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// stripStartCode — drop the Annex-B start code (00 00 01 or 00 00 00 01).
+fn strip_start_code(nal: &[u8]) -> &[u8] {
+    if nal.len() > 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1 {
+        &nal[4..]
+    } else if nal.len() > 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1 {
+        &nal[3..]
+    } else {
+        nal
+    }
+}
+
+/// avccWrap — prepend a 4-byte big-endian length.
+fn avcc_wrap(raw: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(4 + raw.len());
+    b.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+    b.extend_from_slice(raw);
+    b
+}
+
+/// nalType — H.264 NAL unit type from a NAL that may begin with a start code.
+fn nal_type(nal: &[u8]) -> u8 {
+    let mut i = 0usize;
+    while i + 1 < nal.len() {
+        if nal[i] == 0x01 && i >= 2 && nal[i - 1] == 0x00 && nal[i - 2] == 0x00 {
+            if i + 1 < nal.len() {
+                return nal[i + 1] & 0x1f;
+            }
+        }
+        i += 1;
+    }
+    0
+}
+
+/// isFirstSlice — true if the first bit of the slice header is 1
+/// (first_mb_in_slice == 0 → new access unit).
+fn is_first_slice(raw: &[u8]) -> bool {
+    if raw.len() < 2 {
+        return false;
+    }
+    raw[1] & 0x80 != 0
+}
+
+/// buildAVCCConfig — AVCDecoderConfigurationRecord from raw SPS/PPS, with the
+/// 4-byte (02 00 00 00) trailer observed in iPhone captures.
+fn build_avcc_config(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let avcc_len = 6 + 2 + sps.len() + 1 + 2 + pps.len();
+    let mut payload = vec![0u8; avcc_len + 4]; // +4 trailer
+    payload[0] = 0x01; // configurationVersion
+    payload[1] = sps[1]; // AVCProfileIndication
+    payload[2] = sps[2]; // profile_compatibility
+    payload[3] = sps[3]; // AVCLevelIndication
+    payload[4] = 0xff; // lengthSizeMinusOne = 3
+    payload[5] = 0xe1; // numSequenceParameterSets = 1
+    payload[6..8].copy_from_slice(&(sps.len() as u16).to_be_bytes());
+    payload[8..8 + sps.len()].copy_from_slice(sps);
+    let off = 8 + sps.len();
+    payload[off] = 0x01; // numPictureParameterSets = 1
+    payload[off + 1..off + 3].copy_from_slice(&(pps.len() as u16).to_be_bytes());
+    payload[off + 3..off + 3 + pps.len()].copy_from_slice(pps);
+    payload[avcc_len] = 0x02; // trailer
+    payload
+}
+
+// ---------------------------------------------------------------------------
+// SPS dimension parsing (mirror.go spsDimensions + h264BitReader)
+// ---------------------------------------------------------------------------
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    err: bool,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> BitReader<'a> {
+        BitReader {
+            data,
+            pos: 0,
+            err: false,
+        }
+    }
+    fn read_bit(&mut self) -> u32 {
+        if self.pos >= self.data.len() * 8 {
+            self.err = true;
+            return 0;
+        }
+        let b = self.data[self.pos >> 3];
+        let bit = (b >> (7 - (self.pos & 7))) & 1;
+        self.pos += 1;
+        bit as u32
+    }
+    fn read_bits(&mut self, n: usize) -> u32 {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.read_bit();
+        }
+        v
+    }
+    fn read_ue(&mut self) -> u32 {
+        let mut zeros = 0;
+        while self.read_bit() == 0 {
+            if self.err || zeros > 31 {
+                self.err = true;
+                return 0;
+            }
+            zeros += 1;
+        }
+        if zeros == 0 {
+            return 0;
+        }
+        (1u32 << zeros) - 1 + self.read_bits(zeros)
+    }
+    fn read_se(&mut self) -> i32 {
+        let k = self.read_ue();
+        if k & 1 != 0 {
+            ((k + 1) / 2) as i32
+        } else {
+            -((k / 2) as i32)
+        }
+    }
+}
+
+fn strip_emulation_prevention(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut zeros = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if zeros >= 2 && b[i] == 0x03 && i + 1 < b.len() && b[i + 1] <= 0x03 {
+            zeros = 0;
+            i += 1;
+            continue;
+        }
+        if b[i] == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// spsDimensions — coded picture width/height from a raw SPS (with NAL header,
+/// no start code). Returns None on parse failure.
+fn sps_dimensions(sps: &[u8]) -> Option<(i32, i32)> {
+    if sps.len() < 4 || sps[0] & 0x1f != 7 {
+        return None;
+    }
+    let rbsp = strip_emulation_prevention(&sps[1..]);
+    let mut r = BitReader::new(&rbsp);
+
+    let profile_idc = r.read_bits(8);
+    r.read_bits(8); // constraint flags + reserved
+    r.read_bits(8); // level_idc
+    r.read_ue(); // seq_parameter_set_id
+
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        let chroma_format_idc = r.read_ue();
+        if chroma_format_idc == 3 {
+            r.read_bit(); // separate_colour_plane_flag
+        }
+        r.read_ue(); // bit_depth_luma_minus8
+        r.read_ue(); // bit_depth_chroma_minus8
+        r.read_bit(); // qpprime_y_zero_transform_bypass_flag
+        if r.read_bit() == 1 {
+            let n = if chroma_format_idc == 3 { 12 } else { 8 };
+            for i in 0..n {
+                if r.read_bit() == 1 {
+                    let size = if i >= 6 { 64 } else { 16 };
+                    let mut last_scale = 8i32;
+                    let mut next_scale = 8i32;
+                    for _ in 0..size {
+                        if next_scale != 0 {
+                            next_scale = (last_scale + r.read_se() + 256) % 256;
+                        }
+                        if next_scale != 0 {
+                            last_scale = next_scale;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    r.read_ue(); // log2_max_frame_num_minus4
+    let pic_order_cnt_type = r.read_ue();
+    if pic_order_cnt_type == 0 {
+        r.read_ue();
+    } else if pic_order_cnt_type == 1 {
+        r.read_bit();
+        r.read_se();
+        r.read_se();
+        let mut n = r.read_ue();
+        while n > 0 {
+            r.read_se();
+            n -= 1;
+        }
+    }
+    r.read_ue(); // max_num_ref_frames
+    r.read_bit(); // gaps_in_frame_num_value_allowed_flag
+
+    let pic_width_in_mbs_minus1 = r.read_ue();
+    let pic_height_in_map_units_minus1 = r.read_ue();
+    let frame_mbs_only_flag = r.read_bit();
+    if frame_mbs_only_flag == 0 {
+        r.read_bit();
+    }
+    r.read_bit(); // direct_8x8_inference_flag
+
+    let (mut crop_l, mut crop_r, mut crop_t, mut crop_b) = (0u32, 0u32, 0u32, 0u32);
+    if r.read_bit() == 1 {
+        crop_l = r.read_ue();
+        crop_r = r.read_ue();
+        crop_t = r.read_ue();
+        crop_b = r.read_ue();
+    }
+    if r.err {
+        return None;
+    }
+
+    let mut w = (pic_width_in_mbs_minus1 as i32 + 1) * 16;
+    let mut h = (2 - frame_mbs_only_flag as i32) * (pic_height_in_map_units_minus1 as i32 + 1) * 16;
+    let crop_unit_x = 2;
+    let crop_unit_y = 2 * (2 - frame_mbs_only_flag as i32);
+    w -= (crop_l + crop_r) as i32 * crop_unit_x;
+    h -= (crop_t + crop_b) as i32 * crop_unit_y;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+// ---------------------------------------------------------------------------
+// Mirror frame header (mirror.go sendFrame / sendCodecFrame)
+// ---------------------------------------------------------------------------
+
+fn put_f32_le(dst: &mut [u8], v: f32) {
+    dst[..4].copy_from_slice(&v.to_bits().to_le_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Data channel + the mirror driver
+// ---------------------------------------------------------------------------
+
+/// The receiver's video data TCP connection plus the cipher and frame counters.
+/// Shared between the send loop and the data-heartbeat thread (dataMu).
+struct DataChannel {
+    conn: TcpStream,
+    cipher: VideoCipher,
+    /// Per-session forward NTP bias for frame timestamps (mirror.go
+    /// session.timestampBias = sessionLatency). Falls back to
+    /// videoTimestampBias() when <= 0 (mirror.go MirrorSession.ntpTimeNow).
+    timestamp_bias: Duration,
+    frame_seq: u32,
+    // Presentation (display) size advertised in the codec header (offsets 56/60).
+    display_w: i32,
+    display_h: i32,
+    // Encoded content size (read back from SPS), used at offsets 16/20 + 40/44.
+    video_w: i32,
+    video_h: i32,
+}
+
+impl DataChannel {
+    /// ntpTimeNow — per-session NTP frame timestamp using the session
+    /// timestampBias, falling back to videoTimestampBias() when unset
+    /// (mirror.go MirrorSession.ntpTimeNow).
+    fn ntp_time_now(&self) -> u64 {
+        let bias = if self.timestamp_bias > Duration::ZERO {
+            self.timestamp_bias
+        } else {
+            video_timestamp_bias()
+        };
+        ntp_time_with_bias(bias)
+    }
+
+    /// sendCodecFrame — unencrypted SPS+PPS avcC packet (header type 0x01).
+    fn send_codec_frame(&mut self, payload: &[u8], ntp: u64) -> Result<()> {
+        self.frame_seq += 1;
+        let mut header = [0u8; 128];
+        header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[4] = 0x01; // SPS+PPS codec packet (unencrypted)
+        header[5] = 0x00;
+        header[6] = 0x16; // h264 SPS+PPS option
+        header[7] = 0x01;
+        header[8..16].copy_from_slice(&ntp.to_le_bytes());
+
+        let (mut disp_w, mut disp_h) = (self.display_w, self.display_h);
+        if disp_w <= 0 || disp_h <= 0 {
+            disp_w = self.video_w;
+            disp_h = self.video_h;
+        }
+        put_f32_le(&mut header[16..20], self.video_w as f32);
+        put_f32_le(&mut header[20..24], self.video_h as f32);
+        put_f32_le(&mut header[40..44], self.video_w as f32);
+        put_f32_le(&mut header[44..48], self.video_h as f32);
+        put_f32_le(&mut header[56..60], disp_w as f32);
+        put_f32_le(&mut header[60..64], disp_h as f32);
+
+        self.conn
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .ok();
+        self.conn.write_all(&header).context("write codec header")?;
+        self.conn.write_all(payload).context("write codec payload")?;
+        Ok(())
+    }
+
+    /// sendFrame — one encrypted VCL access unit with the 128-byte header.
+    /// `au_data` is AVCC-encoded (4-byte BE length per NALU, no start codes).
+    fn send_frame(&mut self, au_data: &[u8], is_keyframe: bool, ntp: u64) -> Result<()> {
+        self.frame_seq += 1;
+
+        let payload_size = au_data.len() + self.cipher.overhead();
+
+        let mut header = [0u8; 128];
+        header[0..4].copy_from_slice(&(payload_size as u32).to_le_bytes());
+        header[4] = 0x00; // encrypted video data
+        header[5] = if is_keyframe { 0x10 } else { 0x00 };
+        // header[6..8] = 0x00 0x00 for encrypted packets (already zero)
+        header[8..16].copy_from_slice(&ntp.to_le_bytes());
+
+        let frame_payload: Vec<u8> = match &mut self.cipher {
+            VideoCipher::None => au_data.to_vec(),
+            VideoCipher::AesCtr(mc) => mc.encrypt_frame(au_data),
+            VideoCipher::ChaCha { aead, nonce } => {
+                // IETF state matched to the receiver's 64x64: nonce = [0;4]||LE64(N).
+                let mut n = [0u8; 12];
+                n[4..].copy_from_slice(&nonce.to_le_bytes());
+                let sealed = aead
+                    .encrypt(
+                        (&n).into(),
+                        Payload {
+                            msg: au_data,
+                            aad: &header,
+                        },
+                    )
+                    .map_err(|_| anyhow!("chacha seal failed"))?;
+                *nonce += 1;
+                sealed
+            }
+        };
+
+        self.conn
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .ok();
+        self.conn.write_all(&header).context("write frame header")?;
+        self.conn
+            .write_all(&frame_payload)
+            .context("write frame payload")?;
+        Ok(())
+    }
+
+    /// dataHeartbeatLoop frame: 128-byte header, byte4=0x02, byte6=0x1e.
+    fn send_data_heartbeat(&mut self) -> Result<()> {
+        let mut header = [0u8; 128];
+        header[4] = 0x02;
+        header[6] = 0x1e;
+        self.conn
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok();
+        self.conn
+            .write_all(&header)
+            .context("write data heartbeat")?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_mirror: the high-level driver
+// ---------------------------------------------------------------------------
+
+/// generateUUID — RFC-4122 v4, formatted like mirror.go's generateUUID.
+fn generate_uuid() -> String {
+    let mut b = [0u8; 16];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex = |s: &[u8]| s.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&b[0..4]),
+        hex(&b[4..6]),
+        hex(&b[6..8]),
+        hex(&b[8..10]),
+        hex(&b[10..16])
+    )
+}
+
+/// uuidToMAC — stable locally-administered MAC from a UUID-ish string.
+fn uuid_to_mac(id: &str) -> String {
+    let hex: String = id.to_lowercase().chars().filter(|c| *c != '-').collect();
+    if hex.len() < 12 {
+        return "02:00:00:00:00:01".to_string();
+    }
+    let b = &hex.as_bytes()[..12];
+    let mut parts = [
+        std::str::from_utf8(&b[0..2]).unwrap().to_string(),
+        std::str::from_utf8(&b[2..4]).unwrap().to_string(),
+        std::str::from_utf8(&b[4..6]).unwrap().to_string(),
+        std::str::from_utf8(&b[6..8]).unwrap().to_string(),
+        std::str::from_utf8(&b[8..10]).unwrap().to_string(),
+        std::str::from_utf8(&b[10..12]).unwrap().to_string(),
+    ];
+    parts[0] = "02".to_string();
+    parts.join(":").to_uppercase()
+}
+
+/// Run a screen-mirroring session against an established `Session`, until the
+/// capture stream ends or Ctrl-C is pressed. Faithful to mirror.go's
+/// setupMirrorSession + StreamFrames (video only).
+pub fn run_mirror(session: Session, opts: MirrorOpts) -> Result<()> {
+    run_mirror_with_control(session, opts, MirrorControl::new())
+}
+
+/// Like `run_mirror`, but driven by a caller-owned stop flag so an external
+/// controller (e.g. the tray) can stop or switch the mirror at any time. Kept
+/// for callers that only need stop control; for runtime mute/unmute use
+/// `run_mirror_with_control`.
+pub fn run_mirror_with_stop(
+    session: Session,
+    opts: MirrorOpts,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    run_mirror_with_control(session, opts, MirrorControl::with_stop(stop))
+}
+
+/// Like `run_mirror_with_stop`, but additionally accepts a `MirrorControl` so
+/// the daemon/tray can mute/unmute the audio while the mirror is running
+/// (mirror.go SetAudioMuted). The control's stop flag drives shutdown.
+///
+/// Builds its own `CaptureSource`; for the daemon's shared-capture fan-out use
+/// `run_mirror_with_source` instead.
+pub fn run_mirror_with_control(
+    session: Session,
+    opts: MirrorOpts,
+    control_handle: MirrorControl,
+) -> Result<()> {
+    run_mirror_with_source(session, opts, control_handle, None)
+}
+
+/// The full mirror driver. When `source` is `Some`, the mirror consumes its
+/// H.264 byte stream from that `FrameSource` (e.g. a `broadcast::BroadcastSink`
+/// fanned off a single shared `BroadcastCapture`) INSTEAD of building its own
+/// `CaptureSource`. This lets the daemon drive N receivers from ONE screen
+/// capture (daemon.go getOrStartBroadcastLocked → `StreamFrames(sink.AsCapture())`).
+/// When `source` is `None`, it builds and owns its own capture, exactly like
+/// `run_mirror_with_control`.
+pub fn run_mirror_with_source(
+    session: Session,
+    opts: MirrorOpts,
+    control_handle: MirrorControl,
+    source: Option<Box<dyn FrameSource>>,
+) -> Result<()> {
+    use plist::Value;
+
+    let stop = control_handle.stop.clone();
+    // Seed the runtime mute state from the startup --mute flag so a controller
+    // that reads is_muted() / toggles from a known baseline behaves correctly.
+    control_handle
+        .muted
+        .store(opts.mute_audio, Ordering::Relaxed);
+
+    // The mirror RTSP request line uses the full rtsp:// URI as the path. We
+    // reconstruct host/port from the connected socket's peer address.
+    let peer = session
+        .transport
+        .peer_addr()
+        .context("query control socket peer addr")?;
+    let host = peer.0;
+    let port = peer.1;
+
+    let session_uuid = generate_uuid();
+    let client_device_id = uuid_to_mac(&session.session_id);
+
+    // ---- Encryption key material (mirror.go: encKey/encIV = streamKey/iv) ----
+    let enc_key = session.stream_key;
+    let enc_iv = session.iv;
+
+    // Receiver presentation (display) size from GET /info; the codec header
+    // carries this so the receiver can center/pillarbox content (mirror.go feeds
+    // DisplaySize() when nonzero, else sendCodecFrame falls back to content size).
+    let (display_w, display_h) = session.info.display_size();
+    if display_w > 0 && display_h > 0 {
+        crate::dlog!("[mirror] receiver display size: {display_w}x{display_h}");
+    }
+
+    // Keep the pieces we need from the session before moving the control
+    // transport behind an Arc<Mutex> so the keepalive threads can share it.
+    let ekey = session.ekey.clone();
+    let pair_shared_secret = session.pair_keys.shared_secret.clone();
+    // Raw FairPlay AES key — the ChaCha DataStream IKM fallback when no
+    // pair-verify shared secret is present (mirror.go:547-558 `c.fpAesKey`).
+    let fp_aes_key = session.fp_aes_key.clone();
+    // Whether the control channel is HAP-encrypted (pair-verify happened). This
+    // drives selectAudioSecurityMode + the ChaCha video-cipher gate (mirror.go
+    // c.encrypted), NOT shared-secret emptiness.
+    let encrypted = session.transport.is_encrypted();
+    // Receiver playout-latency floor (mirror.go ReceiverInfo.playoutLatencyFloor):
+    // 0 for FairPlay-SAP receivers (feature bit 1<<14), else conservative 500ms.
+    // Computed inline from the features bit to avoid coupling to info.rs.
+    let supports_fairplay_sap = session.info.features & (1 << 14) != 0;
+    let playout_latency_floor = if supports_fairplay_sap {
+        Duration::ZERO
+    } else {
+        latency::CONSERVATIVE_PLAYOUT_LATENCY
+    };
+    let control = Arc::new(Mutex::new(session.transport));
+
+    // ---- Allocate 3 consecutive UDP ports: timing(N), control(N+1), data(N+2).
+    // Real Apple senders use consecutive ports; the Apple TV classifies incoming
+    // audio by source port and expects this pattern (mirror.go:113-124
+    // allocateConsecutiveUDPPortsInRange). The control + data sockets feed the
+    // audio stream; the declared controlPort in the SETUP descriptor is N+1, the
+    // socket we actually send sync packets from. ----
+    let audio_ports =
+        allocate_consecutive_udp(3, opts.port_range).context("allocate audio ports")?;
+    let mut ports_iter = audio_ports.into_iter();
+    let timing_sock = ports_iter.next().unwrap();
+    let audio_ctrl_conn = Some(ports_iter.next().unwrap());
+    let audio_data_conn = Some(ports_iter.next().unwrap());
+    let timing_port = timing_sock.local_addr()?.port();
+
+    // Start NTP timing responder BEFORE sending SETUP so it's ready when the
+    // Apple TV probes us (mirror.go:126-128).
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || ntp_timing_responder(timing_sock, stop));
+    }
+
+    // ---- Event (reverse) channel: open a TCP listener, avoiding the audio UDP
+    // triple [timingPort, timingPort+2], accept the receiver's event connection,
+    // and keep it open for the session lifetime, draining reads
+    // (mirror.go:130-161). Go does NOT carry the sender's event port in the
+    // SETUP plist; it reserves the listener and separately dials the receiver's
+    // own eventPort read back from the SETUP response. ----
+    let event_listener =
+        listen_tcp_avoiding(timing_port, opts.port_range).context("listen event port")?;
+    let event_port = event_listener.local_addr()?.port();
+    crate::dlog!("[mirror] event listener on TCP port {event_port}");
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || event_accept_loop(event_listener, stop));
+    }
+
+    let audio_control_lport = audio_ctrl_conn
+        .as_ref()
+        .and_then(|c| c.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
+
+    // ---- Audio security mode (mirror.go selectAudioSecurityMode(c.encrypted)):
+    // an encrypted (HAP pair-verified) session uses ChaCha20-Poly1305 with a
+    // fresh random 32-byte direct stream key published via `shk`; otherwise the
+    // legacy AES-128-CBC path with the FairPlay key/IV. Keyed on whether the
+    // control channel is encrypted, matching Go's c.encrypted. ----
+    let audio_mode = if encrypted {
+        AudioSecurityMode::ChaCha
+    } else {
+        AudioSecurityMode::LegacyAes
+    };
+    let audio_chacha_key: Option<[u8; 32]> = if audio_mode == AudioSecurityMode::ChaCha {
+        let mut k = [0u8; 32];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut k);
+        Some(k)
+    } else {
+        None
+    };
+    // Legacy AES path reuses the FairPlay key/IV (mirror.go: audioKey = c.fpKey,
+    // audioIV = c.fpIV), which in this port are session.stream_key / session.iv
+    // (the hashed fpKey + random fpIV). Audio encryption is DISABLED when those
+    // are absent (mirror.go: `c.fpKey != nil && c.fpIV != nil`); they are always
+    // present here after FairPlay SAP, so the legacy AES path is enabled.
+    let audio_aes_key: Option<[u8; 16]> = if audio_mode == AudioSecurityMode::LegacyAes {
+        Some(enc_key)
+    } else {
+        None
+    };
+    let audio_aes_iv: Option<[u8; 16]> = if audio_mode == AudioSecurityMode::LegacyAes {
+        Some(enc_iv)
+    } else {
+        None
+    };
+
+    // ---- Phase 1: audio SETUP (creates the session). ----
+    let audio_stream_connection_id: i64 =
+        (now_unix_nanos() & 0x7FFF_FFFF_FFFF_FFFF) as i64;
+    let audio_uri = format!("rtsp://{host}:{port}/{audio_stream_connection_id}");
+
+    // redundantAudio: 2 when FEC is on (legacy), 0 for ChaCha (audio.go
+    // useAudioFEC); disableRetransmits when redundantAudio == 0.
+    let audio_redundant: i64 = if audio::use_audio_fec(audio_mode == AudioSecurityMode::ChaCha) {
+        2
+    } else {
+        0
+    };
+    // sessionLatency = max(TargetLatency(), playoutLatencyFloor()); audio and
+    // video share it so they stay in sync (mirror.go:163-171,218-220). The
+    // RECORD response may later override it (mirror.go:496-508). Audio latency in
+    // 44.1 kHz samples = samplesFor44k1(sessionLatency).
+    let mut session_latency = latency::target_latency();
+    if session_latency < playout_latency_floor {
+        session_latency = playout_latency_floor;
+    }
+    let mut audio_latency_samples = latency::samples_for_44k1(session_latency);
+
+    let mut audio_stream_desc = plist::Dictionary::new();
+    audio_stream_desc.insert("type".into(), Value::Integer(96i64.into()));
+    audio_stream_desc.insert(
+        "streamConnectionID".into(),
+        Value::Integer(audio_stream_connection_id.into()),
+    );
+    audio_stream_desc.insert("ct".into(), Value::Integer(2i64.into())); // ALAC
+    audio_stream_desc.insert("spf".into(), Value::Integer(352i64.into()));
+    audio_stream_desc.insert("sr".into(), Value::Integer(44100i64.into()));
+    audio_stream_desc.insert("audioFormat".into(), Value::Integer(0x40000i64.into()));
+    audio_stream_desc.insert("audioFormatIndex".into(), Value::Integer(0x12i64.into()));
+    audio_stream_desc.insert(
+        "controlPort".into(),
+        Value::Integer((audio_control_lport as i64).into()),
+    );
+    audio_stream_desc.insert("audioMode".into(), Value::String("default".into()));
+    audio_stream_desc.insert("usingScreen".into(), Value::Boolean(true));
+    audio_stream_desc.insert(
+        "latencyMin".into(),
+        Value::Integer((audio_latency_samples as i64).into()),
+    );
+    audio_stream_desc.insert(
+        "latencyMax".into(),
+        Value::Integer((audio_latency_samples as i64).into()),
+    );
+    audio_stream_desc.insert(
+        "redundantAudio".into(),
+        Value::Integer(audio_redundant.into()),
+    );
+    if audio_redundant == 0 {
+        audio_stream_desc.insert("disableRetransmits".into(), Value::Boolean(true));
+    }
+
+    let mut audio_setup = plist::Dictionary::new();
+    audio_setup.insert("deviceID".into(), Value::String(client_device_id.clone()));
+    audio_setup.insert("macAddress".into(), Value::String(client_device_id.clone()));
+    audio_setup.insert("sessionUUID".into(), Value::String(session_uuid.clone()));
+    audio_setup.insert("sourceVersion".into(), Value::String("935.7.1".into()));
+    audio_setup.insert("timingProtocol".into(), Value::String("NTP".into()));
+    audio_setup.insert("timingPort".into(), Value::Integer((timing_port as i64).into()));
+    audio_setup.insert("osBuildVersion".into(), Value::String("23F79".into()));
+    audio_setup.insert("model".into(), Value::String("MacBookPro18,3".into()));
+    audio_setup.insert("name".into(), Value::String("MacBook Pro".into()));
+
+    // Modern HAP receivers look for shk on the audio stream descriptor; legacy
+    // receivers read the FairPlay ekey/eiv from the root (mirror.go).
+    match (&audio_chacha_key, audio_mode) {
+        (Some(key), AudioSecurityMode::ChaCha) => {
+            audio_stream_desc.insert("shk".into(), Value::Data(key.to_vec()));
+            audio_stream_desc.insert("isMedia".into(), Value::Boolean(true));
+            audio_stream_desc.insert("supportsDynamicStreamID".into(), Value::Boolean(true));
+
+            let mut rtp = plist::Dictionary::new();
+            rtp.insert(
+                "streamConnectionKeyUseStreamEncryptionKey".into(),
+                Value::Boolean(true),
+            );
+            let mut rtcp = plist::Dictionary::new();
+            rtcp.insert(
+                "streamConnectionKeyPort".into(),
+                Value::Integer((audio_control_lport as i64).into()),
+            );
+            let mut connections = plist::Dictionary::new();
+            connections.insert("streamConnectionTypeRTP".into(), Value::Dictionary(rtp));
+            connections.insert("streamConnectionTypeRTCP".into(), Value::Dictionary(rtcp));
+            audio_stream_desc
+                .insert("streamConnections".into(), Value::Dictionary(connections));
+        }
+        _ => {
+            // FairPlay ekey/eiv (legacy AES path on the receiver). et=32. Only
+            // added when both FpEkey and fpIV are present (mirror.go:274-281:
+            // `c.FpEkey != nil && c.fpIV != nil`). fpIV (= enc_iv) is always
+            // present here, so the guard reduces to a non-empty ekey.
+            if !ekey.is_empty() {
+                audio_setup.insert("et".into(), Value::Integer(32i64.into()));
+                audio_setup.insert("ekey".into(), Value::Data(ekey.clone()));
+                audio_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
+            }
+        }
+    }
+
+    audio_setup.insert(
+        "streams".into(),
+        Value::Array(vec![Value::Dictionary(audio_stream_desc)]),
+    );
+
+    let audio_body = marshal_plist(&Value::Dictionary(audio_setup))?;
+    let audio_resp = control
+        .lock()
+        .unwrap()
+        .request(
+            "SETUP",
+            &audio_uri,
+            "application/x-apple-binary-plist",
+            &audio_body,
+            &[],
+        )
+        .context("SETUP phase 1 (audio)")?;
+    let audio_resp_plist = parse_plist(&audio_resp.body).ok();
+
+    // Parse the audio data + control ports (type=96 stream) from the response.
+    let (audio_data_port, audio_control_port) = audio_resp_plist
+        .as_ref()
+        .and_then(extract_audio_ports)
+        .unwrap_or((0, 0));
+    if audio_data_port > 0 {
+        crate::dlog!(
+            "[audio] stream: dataPort={audio_data_port} controlPort={audio_control_port}"
+        );
+    }
+
+    // The receiver advertises its own event port in the SETUP response; the
+    // sender dials back to it (mirror.go:336-346).
+    let mut receiver_event_port: u16 = audio_resp_plist
+        .as_ref()
+        .and_then(|p| p.as_dictionary())
+        .and_then(|d| d.get("eventPort"))
+        .and_then(plist_int)
+        .filter(|p| *p > 0)
+        .map(|p| p as u16)
+        .unwrap_or(0);
+
+    // ---- Phase 2: video SETUP ----
+    let video_stream_connection_id: i64 =
+        (now_unix_nanos() & 0x7FFF_FFFF_FFFF_FFFF) as i64;
+    let video_uri = format!("rtsp://{host}:{port}/{video_stream_connection_id}");
+
+    let mut video_stream_desc = plist::Dictionary::new();
+    video_stream_desc.insert("type".into(), Value::Integer(110i64.into()));
+    video_stream_desc.insert(
+        "streamConnectionID".into(),
+        Value::Integer(video_stream_connection_id.into()),
+    );
+    let ts_names = ["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"];
+    let ts_info: Vec<Value> = ts_names
+        .iter()
+        .map(|n| {
+            let mut d = plist::Dictionary::new();
+            d.insert("name".into(), Value::String((*n).into()));
+            Value::Dictionary(d)
+        })
+        .collect();
+    video_stream_desc.insert("timestampInfo".into(), Value::Array(ts_info));
+    if !opts.no_encrypt {
+        video_stream_desc.insert("shk".into(), Value::Data(enc_key.to_vec()));
+        video_stream_desc.insert("shiv".into(), Value::Data(enc_iv.to_vec()));
+    }
+
+    let mut video_setup = plist::Dictionary::new();
+    video_setup.insert("deviceID".into(), Value::String(client_device_id.clone()));
+    video_setup.insert("macAddress".into(), Value::String(client_device_id.clone()));
+    video_setup.insert("sessionUUID".into(), Value::String(session_uuid.clone()));
+    video_setup.insert("sourceVersion".into(), Value::String("935.7.1".into()));
+    video_setup.insert("isScreenMirroringSession".into(), Value::Boolean(true));
+    video_setup.insert("timingProtocol".into(), Value::String("NTP".into()));
+    video_setup.insert("timingPort".into(), Value::Integer((timing_port as i64).into()));
+    video_setup.insert("osBuildVersion".into(), Value::String("23F79".into()));
+    video_setup.insert("model".into(), Value::String("MacBookPro18,3".into()));
+    video_setup.insert("name".into(), Value::String("MacBook Pro".into()));
+    if !opts.no_encrypt {
+        // UxPlay reads ekey/eiv from the root level.
+        video_setup.insert("ekey".into(), Value::Data(ekey.clone()));
+        video_setup.insert("eiv".into(), Value::Data(enc_iv.to_vec()));
+    }
+    video_setup.insert(
+        "streams".into(),
+        Value::Array(vec![Value::Dictionary(video_stream_desc)]),
+    );
+
+    let video_body = marshal_plist(&Value::Dictionary(video_setup))?;
+    let video_resp = control
+        .lock()
+        .unwrap()
+        .request(
+            "SETUP",
+            &video_uri,
+            "application/x-apple-binary-plist",
+            &video_body,
+            &[],
+        )
+        .context("SETUP phase 2 (video)")?;
+    let video_resp_plist =
+        parse_plist(&video_resp.body).context("unmarshal video setup response")?;
+
+    // Fall back to the video SETUP response's eventPort when the audio response
+    // did not carry one (mirror.go:426-437).
+    if receiver_event_port == 0 {
+        if let Some(p) = video_resp_plist
+            .as_dictionary()
+            .and_then(|d| d.get("eventPort"))
+            .and_then(plist_int)
+            .filter(|p| *p > 0)
+        {
+            receiver_event_port = p as u16;
+        }
+    }
+
+    // Connect to the receiver's event port if it advertised one (mirror.go:439-448).
+    // The connection is kept open for the session lifetime as the outbound event
+    // channel; we hold it so it is not dropped/closed early.
+    if receiver_event_port > 0 {
+        use std::net::ToSocketAddrs;
+        let event_addr = format!("{host}:{receiver_event_port}");
+        if let Some(sa) = event_addr.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+                Ok(c) => {
+                    crate::dlog!("[event] connected to receiver event port {event_addr}");
+                    // Drain AND decrypt the receiver's event channel so we can see
+                    // what the TV is actually telling us (it pushes encrypted RTSP
+                    // events here). Tries candidate HAP keys derived from the
+                    // pair-verify shared secret and logs the decrypted plaintext.
+                    let secret = pair_shared_secret.clone();
+                    let stop_evt = stop.clone();
+                    std::thread::spawn(move || decrypt_event_channel(c, secret, stop_evt));
+                }
+                Err(e) => {
+                    crate::dlog!("[event] connect to receiver event port {event_addr} failed: {e}")
+                }
+            }
+        }
+    }
+
+    // Extract the video data port (type=110 stream's dataPort).
+    let data_port = extract_video_data_port(&video_resp_plist)
+        .ok_or_else(|| anyhow!("no video data port in SETUP response"))?;
+
+    // ---- Connect to the receiver's video data TCP port ----
+    let data_addr = format!("{host}:{data_port}");
+    let conn = TcpStream::connect_timeout(
+        &data_addr
+            .parse()
+            .or_else(|_| -> Result<std::net::SocketAddr> {
+                use std::net::ToSocketAddrs;
+                data_addr
+                    .to_socket_addrs()?
+                    .next()
+                    .ok_or_else(|| anyhow!("resolve {data_addr}"))
+            })?,
+        Duration::from_secs(5),
+    )
+    .with_context(|| format!("connect data port {data_addr}"))?;
+    conn.set_nodelay(true).ok();
+    crate::dlog!("[mirror] data channel connected: {data_addr}");
+
+    // Drain the data channel. The receiver sends back-channel bytes on this same
+    // TCP connection; if we never read them, our kernel receive buffer fills, the
+    // receiver's writes block, and after ~25-30s it RSTs the whole session
+    // (observed: TV sent 3 RSTs to a non-draining sender, 0 to a draining one).
+    // doubletake drains it via a goroutine (mirror.go:620). Read on a CLONED
+    // handle so the video writes (under the data lock) and this drain run
+    // concurrently — TCP is full-duplex.
+    if let Ok(mut drain) = conn.try_clone() {
+        let stop_drain = stop.clone();
+        let _ = drain.set_read_timeout(Some(Duration::from_secs(1)));
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if stop_drain.load(Ordering::Relaxed) {
+                    return;
+                }
+                match drain.read(&mut buf) {
+                    Ok(0) => return, // receiver closed the data channel
+                    Ok(_) => {}      // discard back-channel bytes
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    // ---- RECORD to start the session ----
+    let record_resp = control
+        .lock()
+        .unwrap()
+        .request(
+            "RECORD",
+            &audio_uri,
+            "",
+            &[],
+            &[
+                ("Session", session_uuid.as_str()),
+                ("Range", "npt=0-"),
+                ("RTP-Info", "seq=0;rtptime=0"),
+            ],
+        )
+        .context("RECORD")?;
+
+    // The receiver may report its authoritative playout latency via the
+    // Audio-Latency response header. When present and > 0, drive both audio and
+    // video from it so they stay in sync, overriding our fallback floor
+    // (mirror.go:496-508). headers are lowercased by the transport.
+    if let Some(value) = record_resp.headers.get("audio-latency") {
+        match value.trim().parse::<u32>() {
+            Ok(parsed) if parsed > 0 => {
+                audio_latency_samples = parsed;
+                session_latency = Duration::from_nanos(
+                    (parsed as u64) * 1_000_000_000 / 44_100,
+                );
+                crate::dlog!(
+                    "[mirror] receiver audio latency: {parsed} samples ({:?}); using for audio+video",
+                    session_latency
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // The per-session video frame NTP timestamps use this session latency as
+    // their forward bias (mirror.go: session.timestampBias = sessionLatency).
+    let timestamp_bias = session_latency;
+
+    // ---- SET_PARAMETER volume, sent twice like real senders. The initial
+    // volume is always 0.000000 (max); muting is a separate runtime call
+    // (mirror.go:510-519 SetAudioMuted). --mute is applied as a post-setup
+    // SET_PARAMETER below, after the two initial 0.000000 sends. ----
+    let volume_body: &[u8] = b"volume: 0.000000\r\n";
+    let _ = control.lock().unwrap().request(
+        "SET_PARAMETER",
+        &audio_uri,
+        "text/parameters",
+        volume_body,
+        &[],
+    );
+    let _ = control.lock().unwrap().request(
+        "SET_PARAMETER",
+        &audio_uri,
+        "text/parameters",
+        volume_body,
+        &[],
+    );
+    // Expose the control channel + audio URI to the MirrorControl so the
+    // daemon/tray can mute/unmute at runtime (mirror.go SetAudioMuted). Bound
+    // here, after RECORD/SETUP, once the session URI is valid.
+    control_handle.bind(control.clone(), audio_uri.clone());
+
+    // Apply the current desired mute state (seeded from --mute, or updated by an
+    // early set_muted call). When muted, this is the post-setup SET_PARAMETER
+    // mirroring SetAudioMuted(true) (volume -144 dB); the two initial sends above
+    // stay 0.000000. When unmuted nothing extra is sent (already at 0.000000).
+    if control_handle.muted.load(Ordering::Relaxed) {
+        let _ = control.lock().unwrap().request(
+            "SET_PARAMETER",
+            &audio_uri,
+            "text/parameters",
+            VOLUME_MUTED,
+            &[],
+        );
+    }
+
+    // ---- Select the video cipher (mirror.go:544-598 setupMirrorSession) ----
+    // Take the ChaCha20-Poly1305 path when the control channel is encrypted and
+    // either a pair-verify shared secret OR the raw FairPlay AES key is present
+    // (mirror.go:547). The DataStream HKDF IKM is the shared secret when
+    // non-empty, else the raw FairPlay AES key (`session.fp_aes_key`) — matching
+    // mirror.go:552-558. The fpAesKey-only branch covers a FairPlay-SAP receiver
+    // that completed an unencrypted-secret pair-verify (empty shared secret) yet
+    // still expects the DataStream cipher; without it such a session would
+    // wrongly fall to AES-CTR. Otherwise (UxPlay / plaintext) AES-128-CTR.
+    let cipher = if opts.no_encrypt {
+        crate::dlog!("[mirror] video frame encryption DISABLED");
+        VideoCipher::None
+    } else if encrypted && (!pair_shared_secret.is_empty() || !fp_aes_key.is_empty()) {
+        let ikm: &[u8] = if !pair_shared_secret.is_empty() {
+            crate::dlog!(
+                "[mirror] DataStream HKDF IKM: pair-verify shared secret ({} bytes)",
+                pair_shared_secret.len()
+            );
+            &pair_shared_secret
+        } else {
+            crate::dlog!(
+                "[mirror] DataStream HKDF IKM: raw FairPlay AES key ({} bytes)",
+                fp_aes_key.len()
+            );
+            &fp_aes_key
+        };
+        let chacha_key = derive_chacha_key(ikm, video_stream_connection_id)?;
+        let aead = ChaCha20Poly1305::new_from_slice(&chacha_key)
+            .map_err(|_| anyhow!("chacha key length"))?;
+        crate::dlog!("[mirror] cipher: ChaCha20-Poly1305 (HKDF-SHA512)");
+        VideoCipher::ChaCha { aead, nonce: 0 }
+    } else if opts.direct_key {
+        // direct-key (mirror.go:577-580): use shk/shiv directly, no SHA-512
+        // derivation. shk/shiv are the raw stream key/IV (enc_key/enc_iv).
+        crate::dlog!("[mirror] cipher: AES-128-CTR (DIRECT key, no SHA-512 derivation)");
+        VideoCipher::AesCtr(MirrorCipher::new(&enc_key, &enc_iv))
+    } else {
+        let (k, iv) = derive_video_keys(&enc_key, video_stream_connection_id);
+        crate::dlog!("[mirror] cipher: AES-128-CTR (SHA-512 derived)");
+        VideoCipher::AesCtr(MirrorCipher::new(&k, &iv))
+    };
+
+    // Receiver display/presentation size from GET /info: fed into the codec
+    // header (offsets 56/60). When the receiver advertised no usable size these
+    // stay 0 and sendCodecFrame falls back to the encoded content size
+    // (mirror.go behaviour when DisplaySize() is 0).
+    let data = Arc::new(Mutex::new(DataChannel {
+        conn,
+        cipher,
+        timestamp_bias,
+        frame_seq: 0,
+        display_w: display_w as i32,
+        display_h: display_h as i32,
+        video_w: 0,
+        video_h: 0,
+    }));
+
+    // first-frame gate: data-heartbeat / feedback wait for it (mirror.go).
+    let first_frame = Arc::new(AtomicBool::new(false));
+
+    // ---- Background loops ----
+    // Data-channel heartbeat (1s) after the first frame.
+    {
+        let data = data.clone();
+        let first_frame = first_frame.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !first_frame.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut dc = data.lock().unwrap();
+                if dc.send_data_heartbeat().is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    // RTSP keepalive loops on the control channel (mirror.go heartbeatLoop +
+    // feedbackLoop). Both run on background threads sharing the control
+    // transport behind the Arc<Mutex>, and stop when `stop` is set.
+    spawn_heartbeat_loop(
+        control.clone(),
+        audio_uri.clone(),
+        session_uuid.clone(),
+        stop.clone(),
+    );
+    spawn_feedback_loop(control.clone(), stop.clone());
+
+    // NOTE: do NOT install a Ctrl-C handler here. The CLI (cmd_mirror) installs
+    // its own SIGINT/SIGTERM handler; the tray must NOT have one hijacked by the
+    // mirror worker (it would catch Ctrl-C and only stop the mirror, never let
+    // the tray process exit). ctrlc::set_handler is process-global + once-only.
+
+    // ---- Audio: set up the RTP audio stream + start capture, then run the
+    // StreamAudio loop on its own thread gated on the same first-frame / stop
+    // flags as video (mirror.go: setupAudioStream is created after RECORD and
+    // StreamAudio is launched alongside StreamFrames). ----
+    let mut audio_handle: Option<std::thread::JoinHandle<()>> = None;
+    if !opts.no_audio {
+        if let (Some(ctrl_conn), Some(data_conn)) = (audio_ctrl_conn, audio_data_conn) {
+            if audio_data_port > 0 {
+                let audio_ct = audio::AUDIO_CT_ALAC;
+                match audio::setup_audio_stream(
+                    &host,
+                    audio_data_port,
+                    audio_control_port,
+                    audio_aes_key,
+                    audio_aes_iv,
+                    audio_chacha_key,
+                    audio_mode,
+                    audio_ct,
+                    audio_latency_samples,
+                    ctrl_conn,
+                    data_conn,
+                ) {
+                    Ok(stream) => {
+                        let audio_stream = Arc::new(Mutex::new(stream));
+                        let audio_capture = if opts.test_audio {
+                            audio::AudioCapture::start(true)
+                        } else if let Some(file) = opts.file.as_deref() {
+                            audio::AudioCapture::start_file(file)
+                        } else {
+                            audio::AudioCapture::start(opts.test)
+                        };
+                        match audio_capture {
+                            Ok(mut capture) => {
+                                crate::dlog!("[audio] capture started; streaming audio alongside video");
+                                let first_frame = first_frame.clone();
+                                let stop = stop.clone();
+                                let boot = boot_origin();
+                                audio_handle = Some(std::thread::spawn(move || {
+                                    if let Err(e) = audio::stream_audio(
+                                        &mut capture,
+                                        audio_stream,
+                                        &first_frame,
+                                        &stop,
+                                        boot,
+                                    ) {
+                                        crate::dlog!("[audio] stream ended: {e}");
+                                    }
+                                    capture.stop();
+                                }));
+                            }
+                            Err(e) => {
+                                crate::dlog!("[audio] capture start failed: {e}; continuing video-only");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        crate::dlog!("[audio] stream setup failed: {e}; continuing video-only");
+                    }
+                }
+            } else {
+                crate::dlog!("[audio] receiver did not provide audio ports; skipping audio");
+            }
+        }
+    } else {
+        crate::dlog!("[audio] disabled (--no-audio)");
+    }
+
+    // ---- Capture + stream (mirror.go StreamFrames) ----
+    // When the caller supplied a `FrameSource` (the daemon's shared
+    // BroadcastSink), consume from it; otherwise build and own a CaptureSource.
+    // A shared source is owned/torn down by whoever drives the BroadcastCapture
+    // pump; an owned capture we stop() on teardown.
+    let mut owned_capture: Option<CaptureSource> = None;
+    let result = match source {
+        Some(mut src) => {
+            crate::dlog!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
+            stream_frames(src.as_mut(), &data, &first_frame, &stop)
+        }
+        None => {
+            let capture_cfg = CaptureConfig {
+                file: opts.file.clone(),
+                fps: opts.fps,
+                bitrate_kbps: opts.bitrate_kbps,
+                fit_pct: opts.fit_pct,
+                live_underscan: opts.live_underscan,
+                force_software: opts.force_software_encoder,
+                test: opts.test,
+                restore_token: None,
+                on_restore_token: None,
+            };
+            let mut capture = CaptureSource::start(&capture_cfg).context("start capture")?;
+            // Hand the live underscan handle to the control so the tray can
+            // retune the border mid-stream (slider / scroll), no rebuild.
+            if let Some(lf) = capture.live_fit() {
+                control_handle.bind_fit(lf);
+            }
+            crate::dlog!("[mirror] streaming… (Ctrl-C to stop)");
+            let r = stream_frames(&mut capture, &data, &first_frame, &stop);
+            owned_capture = Some(capture);
+            r
+        }
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    if let Some(capture) = owned_capture.as_mut() {
+        capture.stop();
+    }
+
+    // Let the audio thread observe `stop` and wind down its capture/sender.
+    if let Some(h) = audio_handle.take() {
+        let _ = h.join();
+    }
+
+    // ---- TEARDOWN ----
+    control_handle.unbind();
+    let _ = control
+        .lock()
+        .unwrap()
+        .request("TEARDOWN", &audio_uri, "", &[], &[]);
+
+    result
+}
+
+/// try_consecutive_udp — bind `count` consecutive UDP ports starting at `base`.
+/// `base == 0` lets the OS pick the first port (subsequent are base+1, …).
+/// Returns the bound sockets on full success, else None (partials dropped).
+fn try_consecutive_udp(base: u16, count: usize) -> Option<Vec<std::net::UdpSocket>> {
+    use std::net::UdpSocket;
+    let first = UdpSocket::bind(("0.0.0.0", base)).ok()?;
+    let actual_base = first.local_addr().ok()?.port();
+    if actual_base == 0 || (actual_base as usize) + count - 1 > u16::MAX as usize {
+        return None;
+    }
+    let mut conns = vec![first];
+    for i in 1..count {
+        match UdpSocket::bind(("0.0.0.0", actual_base + i as u16)) {
+            Ok(c) => conns.push(c),
+            Err(_) => return None, // partials dropped on return
+        }
+    }
+    Some(conns)
+}
+
+/// allocateConsecutiveUDPPortsInRange (mirror.go:1818-1850) — allocate `count`
+/// consecutive UDP ports: timing(N), control(N+1), data(N+2). The Apple TV
+/// classifies incoming audio by source port and expects this consecutive
+/// pattern. When `range` is `None`, the OS picks the base (retry 20×); otherwise
+/// the search is limited to `[min, max]` inclusive. An exhausted explicit range
+/// is a hard error (matching Go — no ephemeral fallback).
+fn allocate_consecutive_udp(
+    count: usize,
+    range: Option<(u16, u16)>,
+) -> Result<Vec<std::net::UdpSocket>> {
+    let (lo, hi) = match range {
+        None => {
+            for _ in 0..20 {
+                if let Some(conns) = try_consecutive_udp(0, count) {
+                    return Ok(conns);
+                }
+            }
+            return Err(anyhow!(
+                "could not allocate {count} consecutive UDP ports after 20 attempts"
+            ));
+        }
+        Some(r) => r,
+    };
+    if lo == 0 || hi == 0 || lo > hi {
+        bail!("invalid UDP port range {lo}-{hi}");
+    }
+    if ((hi - lo + 1) as usize) < count {
+        bail!("UDP port range {lo}-{hi} too small for {count} consecutive ports");
+    }
+    let mut base = lo;
+    while base as usize <= hi as usize - count + 1 {
+        if let Some(conns) = try_consecutive_udp(base, count) {
+            return Ok(conns);
+        }
+        base += 1;
+    }
+    bail!("no {count} consecutive free UDP ports in range {lo}-{hi}")
+}
+
+/// listenTCPInRange (mirror.go:1873-1893) — open a TCP listener for the event
+/// channel, avoiding the audio UDP triple `[skip_base, skip_base+2]`. When
+/// `range` is `None`, the OS picks an ephemeral port (re-bind until it doesn't
+/// overlap the triple); otherwise scan `[min, max]` for the first free port,
+/// skipping the triple. An exhausted explicit range is a hard error.
+fn listen_tcp_avoiding(
+    skip_base: u16,
+    range: Option<(u16, u16)>,
+) -> Result<std::net::TcpListener> {
+    use std::net::TcpListener;
+    let (lo, hi) = match range {
+        None => {
+            for _ in 0..32 {
+                let l = TcpListener::bind("0.0.0.0:0").context("listen event TCP")?;
+                let p = l.local_addr()?.port();
+                if skip_base > 0 && p >= skip_base && p <= skip_base.saturating_add(2) {
+                    continue; // overlaps the audio UDP triple; re-bind.
+                }
+                return Ok(l);
+            }
+            return Err(anyhow!("no free TCP port for the event channel"));
+        }
+        Some(r) => r,
+    };
+    if lo == 0 || hi == 0 || lo > hi {
+        bail!("invalid TCP port range {lo}-{hi}");
+    }
+    for p in lo..=hi {
+        if skip_base > 0 && p >= skip_base && p <= skip_base.saturating_add(2) {
+            continue;
+        }
+        if let Ok(l) = TcpListener::bind(("0.0.0.0", p)) {
+            return Ok(l);
+        }
+    }
+    bail!("no free TCP port in range {lo}-{hi}")
+}
+
+/// event_accept_loop — accept the receiver's inbound event (reverse) connection,
+/// then keep it open for the session lifetime, draining reads until the peer
+/// closes or `stop` is set (mirror.go:139-161).
+fn event_accept_loop(listener: std::net::TcpListener, stop: Arc<AtomicBool>) {
+    let conn = match listener.accept() {
+        Ok((c, addr)) => {
+            crate::dlog!("[event] Apple TV connected for reverse events from {addr}");
+            c
+        }
+        Err(_) => return,
+    };
+    // Short read timeout so the drain loop can observe the stop flag.
+    conn.set_read_timeout(Some(Duration::from_secs(1))).ok();
+    let mut buf = [0u8; 4096];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match (&conn).read(&mut buf) {
+            Ok(0) => return, // peer closed
+            Ok(_n) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// extract_audio_ports — find the type=96 stream's data/control ports in a SETUP
+/// response plist (mirror.go plistStreamPorts: dataPort/controlPort, or the
+/// modern streamConnections RTP/RTCP `streamConnectionKeyPort`).
+fn extract_audio_ports(resp: &plist::Value) -> Option<(u16, u16)> {
+    let dict = resp.as_dictionary()?;
+    let streams = dict.get("streams")?.as_array()?;
+    for s in streams {
+        let sd = match s.as_dictionary() {
+            Some(d) => d,
+            None => continue,
+        };
+        if sd.get("type").and_then(plist_int) != Some(96) {
+            continue;
+        }
+        let mut data_port = sd.get("dataPort").and_then(plist_int).unwrap_or(0);
+        let mut control_port = sd.get("controlPort").and_then(plist_int).unwrap_or(0);
+        if let Some(conns) = sd.get("streamConnections").and_then(|v| v.as_dictionary()) {
+            if let Some(rtp) = conns
+                .get("streamConnectionTypeRTP")
+                .and_then(|v| v.as_dictionary())
+            {
+                if let Some(p) = rtp.get("streamConnectionKeyPort").and_then(plist_int) {
+                    if p > 0 {
+                        data_port = p;
+                    }
+                }
+            }
+            if let Some(rtcp) = conns
+                .get("streamConnectionTypeRTCP")
+                .and_then(|v| v.as_dictionary())
+            {
+                if let Some(p) = rtcp.get("streamConnectionKeyPort").and_then(plist_int) {
+                    if p > 0 {
+                        control_port = p;
+                    }
+                }
+            }
+        }
+        return Some((data_port as u16, control_port as u16));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// RTSP control-channel keepalive loops (mirror.go heartbeatLoop + feedbackLoop)
+// ---------------------------------------------------------------------------
+
+/// heartbeatLoop — periodic GET_PARAMETER on the control URI every 15s, with
+/// the `Session` header. Some receivers (Apple TV) return 400 for
+/// GET_PARAMETER; after 3 consecutive failures we silently stop (the /feedback
+/// POST and data-channel heartbeat provide redundant keepalive). Starts at SETUP
+/// time (mirror.go:634), not gated on the first frame, and stops when `stop` is
+/// set.
+fn spawn_heartbeat_loop(
+    control: Arc<Mutex<Transport>>,
+    uri: String,
+    session_id: String,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        // mirror.go:634 starts this loop at SETUP time (immediately), NOT gated
+        // on the first frame. The 15s ticker fires the first request after 15s.
+        let mut consecutive_failures = 0u32;
+        loop {
+            // 15s tick, checking the stop flag every 100ms.
+            let mut waited = Duration::ZERO;
+            while waited < Duration::from_secs(15) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                waited += Duration::from_millis(100);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let res = {
+                let mut t = control.lock().unwrap();
+                t.request(
+                    "GET_PARAMETER",
+                    &uri,
+                    "",
+                    &[],
+                    &[("Session", session_id.as_str())],
+                )
+            };
+            match res {
+                Ok(_) => consecutive_failures = 0,
+                Err(_) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        // Silently disable GET_PARAMETER keepalive.
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// feedbackLoop — POST /feedback every 2s, with an immediate first feedback to
+/// beat UxPlay's ~3s timeout. Starts at SETUP time (mirror.go:636), not gated on
+/// the first frame, so the immediate first feedback actually happens early. Stops
+/// when `stop` is set. Faithful port of mirror.go's feedbackLoop.
+fn spawn_feedback_loop(
+    control: Arc<Mutex<Transport>>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        // Immediate first feedback (mirror.go sends one before the ticker).
+        {
+            let mut t = control.lock().unwrap();
+            let _ = t.request("POST", "/feedback", "", &[], &[]);
+        }
+
+        loop {
+            let mut waited = Duration::ZERO;
+            while waited < Duration::from_secs(2) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                waited += Duration::from_millis(100);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut t = control.lock().unwrap();
+            let _ = t.request("POST", "/feedback", "", &[], &[]);
+        }
+    });
+}
+
+/// stream_frames — the NAL-parsing send loop, a faithful port of
+/// mirror.go's StreamFrames (without the congestion controller's logging
+/// noise; the drop logic is preserved).
+/// Read, decrypt, and log the receiver's event channel so we can see what the
+/// TV actually sends (encrypted RTSP events). HAP framing is `[u16 LE len]
+/// [ciphertext len+16]`, ChaCha20-Poly1305, nonce `[0;4]||LE64(counter)` from 0,
+/// AAD = the 2-byte length. We don't know which key the event channel uses, so we
+/// try several candidates derived from the pair-verify shared secret and lock
+/// onto whichever decrypts the first frame.
+/// Parse one complete RTSP request from `buf`. Returns (CSeq, total bytes
+/// consumed) once the full headers + Content-Length body are present, else None.
+fn parse_rtsp_request(buf: &[u8]) -> Option<(u32, usize)> {
+    let hdr_end = find_subseq(buf, b"\r\n\r\n")? + 4;
+    let head = String::from_utf8_lossy(&buf[..hdr_end]);
+    let mut cseq = 0u32;
+    let mut content_len = 0usize;
+    for line in head.lines() {
+        let l = line.to_ascii_lowercase();
+        if let Some(v) = l.strip_prefix("cseq:") {
+            cseq = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = l.strip_prefix("content-length:") {
+            content_len = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let total = hdr_end + content_len;
+    if buf.len() < total {
+        return None; // body not fully arrived yet
+    }
+    Some((cseq, total))
+}
+
+fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn decrypt_event_channel(mut conn: TcpStream, secret: Vec<u8>, stop: Arc<AtomicBool>) {
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+    let derive = |salt: &[u8], info: &[u8]| -> [u8; 32] {
+        let hk = Hkdf::<Sha512>::new(Some(salt), &secret);
+        let mut k = [0u8; 32];
+        let _ = hk.expand(info, &mut k);
+        k
+    };
+    // Sender's perspective: "Read" = receiver->sender. Try Events-* and Control-*
+    // in both directions in case the naming/derivation differs.
+    let candidates: Vec<(&str, [u8; 32])> = vec![
+        ("Events-Read", derive(b"Events-Salt", b"Events-Read-Encryption-Key")),
+        ("Events-Write", derive(b"Events-Salt", b"Events-Write-Encryption-Key")),
+        ("Control-Read", derive(b"Control-Salt", b"Control-Read-Encryption-Key")),
+        ("Control-Write", derive(b"Control-Salt", b"Control-Write-Encryption-Key")),
+    ];
+    let hx = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let mut nonces = vec![0u64; candidates.len()];
+    let mut chosen: Option<usize> = None;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let mut logged_raw = false;
+
+    // The receiver sends RTSP requests (e.g. POST /command) on this channel and
+    // expects RTSP responses; without a reply it RSTs the whole session at ~30s.
+    // We write responses encrypted with the COMPLEMENTARY key — the receiver
+    // sends with Events-Write, so it reads our writes with Events-Read.
+    let resp_key = derive(b"Events-Salt", b"Events-Read-Encryption-Key");
+    let mut resp_nonce: u64 = 0;
+    let mut req: Vec<u8> = Vec::new(); // accumulates one RTSP request across frames
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match conn.read(&mut tmp) {
+            Ok(0) => {
+                crate::dlog!("[event] receiver closed the event channel");
+                return;
+            }
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => return,
+        }
+        if !logged_raw && buf.len() >= 4 {
+            crate::dlog!(
+                "[event] raw first {} bytes: {}",
+                buf.len().min(64),
+                hx(&buf[..buf.len().min(64)])
+            );
+            logged_raw = true;
+        }
+        // Try to parse HAP frames.
+        loop {
+            if buf.len() < 2 {
+                break;
+            }
+            let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+            if len == 0 || len > 1500 {
+                if chosen.is_none() {
+                    crate::dlog!(
+                        "[event] not HAP-framed (len field={len}); raw: {}",
+                        hx(&buf[..buf.len().min(64)])
+                    );
+                }
+                return;
+            }
+            if buf.len() < 2 + len + 16 {
+                break;
+            }
+            let aad = [buf[0], buf[1]];
+            let ct = buf[2..2 + len + 16].to_vec();
+            let idxs: Vec<usize> = match chosen {
+                Some(i) => vec![i],
+                None => (0..candidates.len()).collect(),
+            };
+            let mut ok = false;
+            for &i in &idxs {
+                let cipher = match ChaCha20Poly1305::new_from_slice(&candidates[i].1) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut nonce = [0u8; 12];
+                nonce[4..].copy_from_slice(&nonces[i].to_le_bytes());
+                if let Ok(pt) = cipher.decrypt(
+                    (&nonce).into(),
+                    Payload {
+                        msg: &ct,
+                        aad: &aad,
+                    },
+                ) {
+                    if chosen.is_none() {
+                        crate::dlog!("[event] answering receiver /command keepalives (key {})", candidates[i].0);
+                        chosen = Some(i);
+                    }
+                    nonces[i] += 1;
+                    req.extend_from_slice(&pt);
+                    // Respond to each complete RTSP request in `req`.
+                    while let Some((cseq, consumed)) = parse_rtsp_request(&req) {
+                        crate::dlog!(
+                            "[event] >>> {}",
+                            String::from_utf8_lossy(&req[..consumed.min(80)])
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                        );
+                        let body = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n");
+                        let mut frame = (body.len() as u16).to_le_bytes().to_vec();
+                        let aad2 = (body.len() as u16).to_le_bytes();
+                        let mut n2 = [0u8; 12];
+                        n2[4..].copy_from_slice(&resp_nonce.to_le_bytes());
+                        if let Ok(cph) = ChaCha20Poly1305::new_from_slice(&resp_key) {
+                            if let Ok(sealed) = cph.encrypt(
+                                (&n2).into(),
+                                Payload {
+                                    msg: body.as_bytes(),
+                                    aad: &aad2,
+                                },
+                            ) {
+                                frame.extend_from_slice(&sealed);
+                                let _ = conn.write_all(&frame);
+                                resp_nonce += 1;
+                                crate::dlog!("[event] <<< RTSP/1.0 200 OK (CSeq {cseq})");
+                            }
+                        }
+                        req.drain(..consumed);
+                    }
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                if chosen.is_none() {
+                    crate::dlog!(
+                        "[event] no candidate key decrypted frame (len={len}); ct: {}",
+                        hx(&ct[..ct.len().min(48)])
+                    );
+                }
+                return;
+            }
+            buf.drain(..2 + len + 16);
+        }
+    }
+}
+
+fn stream_frames(
+    capture: &mut dyn FrameSource,
+    data: &Arc<Mutex<DataChannel>>,
+    first_frame: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut parser = H264Parser::new();
+
+    let mut latest_sps: Option<Vec<u8>> = None;
+    let mut latest_pps: Option<Vec<u8>> = None;
+    let mut vcl_buf: Vec<u8> = Vec::new();
+    let mut pending_keyframe = false;
+    let mut codec_sent = false;
+    let mut stream_primed = false;
+    let mut frame_count: i64 = 0;
+    let mut cc = CongestionController::new();
+
+    // Closure-free flush implemented inline via a helper fn would need many
+    // params; keep it a local macro-like block.
+    macro_rules! flush_vcl {
+        () => {{
+            let res: Result<()> = (|| {
+                if vcl_buf.is_empty() {
+                    return Ok(());
+                }
+                if !stream_primed
+                    && (!pending_keyframe || latest_sps.is_none() || latest_pps.is_none())
+                {
+                    vcl_buf.clear();
+                    return Ok(());
+                }
+                if !pending_keyframe && cc.should_drop(frame_count) {
+                    vcl_buf.clear();
+                    return Ok(());
+                }
+
+                // Per-session NTP bias (mirror.go: packetTimestamp = s.ntpTimeNow()).
+                let ntp = data.lock().unwrap().ntp_time_now();
+
+                if pending_keyframe && !codec_sent {
+                    if let (Some(sps), Some(pps)) = (&latest_sps, &latest_pps) {
+                        if let Some((w, h)) = sps_dimensions(sps) {
+                            let mut dc = data.lock().unwrap();
+                            dc.video_w = w;
+                            dc.video_h = h;
+                        }
+                        let avcc = build_avcc_config(sps, pps);
+                        {
+                            let mut dc = data.lock().unwrap();
+                            dc.send_codec_frame(&avcc, ntp)?;
+                        }
+                        first_frame.store(true, Ordering::Relaxed);
+                        codec_sent = true;
+                        stream_primed = true;
+                    }
+                }
+
+                let send_start = Instant::now();
+                let sent_len = {
+                    let mut dc = data.lock().unwrap();
+                    dc.send_frame(&vcl_buf, pending_keyframe, ntp)?;
+                    vcl_buf.len()
+                };
+                cc.record_send(sent_len + 128, send_start.elapsed());
+                vcl_buf.clear();
+                pending_keyframe = false;
+                codec_sent = false;
+                frame_count += 1;
+                if frame_count <= 5 || frame_count % 150 == 0 {
+                    crate::dlog!("[mirror] sent video frame {frame_count} (len={sent_len})");
+                }
+                Ok(())
+            })();
+            res
+        }};
+    }
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let n = capture.read(&mut buf)?;
+        if n == 0 {
+            // EOF: flush and stop.
+            flush_vcl!()?;
+            return Ok(());
+        }
+
+        let nals = parser.push(&buf[..n]);
+        for nal in nals {
+            let nt = nal_type(&nal);
+            let raw = strip_start_code(&nal).to_vec();
+
+            match nt {
+                9 => {
+                    // AUD — flush previous AU.
+                    flush_vcl!()?;
+                }
+                7 => {
+                    // SPS — flush before keyframe.
+                    flush_vcl!()?;
+                    latest_sps = Some(raw);
+                }
+                8 => {
+                    latest_pps = Some(raw);
+                }
+                6 => {
+                    // SEI — skip.
+                }
+                5 => {
+                    // IDR VCL slice.
+                    if !vcl_buf.is_empty() && !pending_keyframe {
+                        flush_vcl!()?;
+                    }
+                    if !vcl_buf.is_empty() && pending_keyframe && is_first_slice(&raw) {
+                        flush_vcl!()?;
+                    }
+                    pending_keyframe = true;
+                    vcl_buf.extend_from_slice(&avcc_wrap(&raw));
+                }
+                1 | 2 | 3 | 4 => {
+                    // non-IDR VCL slice.
+                    if !vcl_buf.is_empty() && pending_keyframe {
+                        flush_vcl!()?;
+                    }
+                    if !vcl_buf.is_empty() && !pending_keyframe && is_first_slice(&raw) {
+                        flush_vcl!()?;
+                    }
+                    vcl_buf.extend_from_slice(&avcc_wrap(&raw));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Congestion controller (mirror.go congestionController)
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Clone, Copy)]
+enum CongestionLevel {
+    None,
+    Light,
+    Medium,
+    Heavy,
+}
+
+struct CongestionController {
+    ewma_ns_per_byte: f64,
+    samples: u64,
+    level: CongestionLevel,
+    skipped: u64,
+}
+
+impl CongestionController {
+    fn new() -> CongestionController {
+        CongestionController {
+            ewma_ns_per_byte: 0.0,
+            samples: 0,
+            level: CongestionLevel::None,
+            skipped: 0,
+        }
+    }
+
+    fn record_send(&mut self, bytes: usize, dur: Duration) {
+        if bytes == 0 {
+            return;
+        }
+        let ns_per_byte = dur.as_nanos() as f64 / bytes as f64;
+        const ALPHA: f64 = 0.3;
+        if self.samples == 0 {
+            self.ewma_ns_per_byte = ns_per_byte;
+        } else {
+            self.ewma_ns_per_byte = ALPHA * ns_per_byte + (1.0 - ALPHA) * self.ewma_ns_per_byte;
+        }
+        self.samples += 1;
+
+        let new_level = if self.ewma_ns_per_byte > 50000.0 {
+            CongestionLevel::Heavy
+        } else if self.ewma_ns_per_byte > 20000.0 {
+            CongestionLevel::Medium
+        } else if self.ewma_ns_per_byte > 10000.0 {
+            CongestionLevel::Light
+        } else {
+            CongestionLevel::None
+        };
+        if new_level != self.level {
+            if new_level == CongestionLevel::None {
+                self.skipped = 0;
+            }
+            self.level = new_level;
+        }
+    }
+
+    fn should_drop(&mut self, frame_count: i64) -> bool {
+        match self.level {
+            CongestionLevel::Light => {
+                if frame_count % 3 == 0 {
+                    self.skipped += 1;
+                    return true;
+                }
+            }
+            CongestionLevel::Medium => {
+                if frame_count % 2 == 0 {
+                    self.skipped += 1;
+                    return true;
+                }
+            }
+            CongestionLevel::Heavy => {
+                self.skipped += 1;
+                return true;
+            }
+            CongestionLevel::None => {}
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NTP timing responder (mirror.go ntpTimingResponder)
+// ---------------------------------------------------------------------------
+
+fn ntp_timing_responder(sock: std::net::UdpSocket, stop: Arc<AtomicBool>) {
+    sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let mut buf = [0u8; 128];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let (n, addr) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        };
+        if n < 32 {
+            continue;
+        }
+        let now = ntp_boot_timestamp();
+        let mut reply = [0u8; 32];
+        reply[..32].copy_from_slice(&buf[..32]);
+        reply[0] = 0x80;
+        reply[1] = 0xd3;
+        // Reference = sender's transmit timestamp (echo bytes 24..32).
+        reply[8..16].copy_from_slice(&buf[24..32]);
+        // Receive + Transmit timestamps = now (BE).
+        reply[16..24].copy_from_slice(&now.to_be_bytes());
+        reply[24..32].copy_from_slice(&now.to_be_bytes());
+        let r = sock.send_to(&reply, addr);
+        crate::dlog!("[NTP] probe from {addr} ({n} bytes) -> reply {:?}", r.is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// plist helpers + small utilities
+// ---------------------------------------------------------------------------
+
+fn marshal_plist(v: &plist::Value) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    plist::to_writer_binary(&mut out, v).context("marshal binary plist")?;
+    Ok(out)
+}
+
+fn parse_plist(data: &[u8]) -> Result<plist::Value> {
+    plist::Value::from_reader(std::io::Cursor::new(data)).context("parse plist")
+}
+
+/// extract_video_data_port — find the type=110 stream's dataPort in a SETUP
+/// response plist (mirror.go's loop over response["streams"]).
+fn extract_video_data_port(resp: &plist::Value) -> Option<u16> {
+    let dict = resp.as_dictionary()?;
+    let streams = dict.get("streams")?.as_array()?;
+    for s in streams {
+        let sd = match s.as_dictionary() {
+            Some(d) => d,
+            None => continue,
+        };
+        let st = sd.get("type").and_then(plist_int);
+        if st == Some(110) {
+            if let Some(p) = sd.get("dataPort").and_then(plist_int) {
+                return Some(p as u16);
+            }
+        }
+    }
+    None
+}
+
+fn plist_int(v: &plist::Value) -> Option<i64> {
+    if let Some(i) = v.as_signed_integer() {
+        Some(i)
+    } else {
+        v.as_unsigned_integer().map(|u| u as i64)
+    }
+}
+
+fn now_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod mirror_feature_tests {
+    use super::*;
+
+    #[test]
+    fn parse_port_range_empty_is_none() {
+        assert_eq!(parse_port_range("").unwrap(), None);
+        assert_eq!(parse_port_range("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_port_range_valid() {
+        assert_eq!(parse_port_range("60000-60010").unwrap(), Some((60000, 60010)));
+        // exactly 4 ports is the minimum allowed.
+        assert_eq!(parse_port_range("100-103").unwrap(), Some((100, 103)));
+        // surrounding whitespace is trimmed (matches Go TrimSpace).
+        assert_eq!(parse_port_range(" 200 - 250 ").unwrap(), Some((200, 250)));
+    }
+
+    #[test]
+    fn parse_port_range_rejects_bad() {
+        assert!(parse_port_range("60000").is_err()); // no dash
+        assert!(parse_port_range("abc-def").is_err()); // non-numeric
+        assert!(parse_port_range("100-99").is_err()); // min > max
+        assert!(parse_port_range("0-10").is_err()); // min < 1
+        assert!(parse_port_range("60000-70000").is_err()); // max > 65535
+        assert!(parse_port_range("100-102").is_err()); // < 4 ports
+    }
+
+    #[test]
+    fn mute_body_bytes_match_go() {
+        // mirror.go SetAudioMuted: "0.000000" max / "-144.000000" muted, with a
+        // trailing CRLF — exactly what we send on the control channel.
+        assert_eq!(VOLUME_UNMUTED, b"volume: 0.000000\r\n");
+        assert_eq!(VOLUME_MUTED, b"volume: -144.000000\r\n");
+    }
+
+    #[test]
+    fn mirror_control_seeds_and_toggles_muted() {
+        let c = MirrorControl::new();
+        assert!(!c.is_muted());
+        // Before the control channel is bound, set_muted just records the state.
+        c.set_muted(true).unwrap();
+        assert!(c.is_muted());
+        c.set_muted(false).unwrap();
+        assert!(!c.is_muted());
+    }
+}
