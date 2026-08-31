@@ -1,0 +1,117 @@
+diff --git a/rust/airfry/src/audio.rs b/rust/airfry/src/audio.rs
+index ed8ece7..a2561ba 100644
+--- a/rust/airfry/src/audio.rs
++++ b/rust/airfry/src/audio.rs
+@@ -482,9 +482,13 @@ impl AudioCapture {
+     }
+ 
+     /// Read the selected local file's audio as the ALAC input format.
+-    pub fn start_file(path: &str) -> Result<AudioCapture> {
++    pub fn start_file(path: &str, start_seconds: f64) -> Result<AudioCapture> {
+         gst::init().context("gst init (file audio)")?;
+-        let mut child = std::process::Command::new("ffmpeg")
++        let mut command = std::process::Command::new("ffmpeg");
++        if start_seconds > 0.0 {
++            command.args(["-ss", &start_seconds.to_string()]);
++        }
++        let mut child = command
+             // The RTP loop below is the pacing clock. Using FFmpeg's -re as
+             // well would throttle the pipe and then throttle it a second
+             // time after each packet, causing periodic audio starvation.
+diff --git a/rust/airfry/src/capture.rs b/rust/airfry/src/capture.rs
+index be783da..77eff08 100644
+--- a/rust/airfry/src/capture.rs
++++ b/rust/airfry/src/capture.rs
+@@ -48,6 +48,7 @@ pub type RestoreTokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
+ /// pipeline actually uses).
+ #[derive(Clone)]
+ pub struct CaptureConfig {
++    pub start_seconds: f64,
+     /// Optional local file. When set, FFmpeg supplies Annex-B H.264 frames.
+     pub file: Option<String>,
+     /// Target frame rate (defaults to 30 if 0).
+@@ -95,6 +96,7 @@ impl std::fmt::Debug for CaptureConfig {
+ impl Default for CaptureConfig {
+     fn default() -> Self {
+         CaptureConfig {
++            start_seconds: 0.0,
+             file: None,
+             fps: 30,
+             bitrate_kbps: 0,
+@@ -214,7 +216,11 @@ impl CaptureSource {
+     /// the existing AirPlay transport can then be validated independently of
+     /// screen capture and AAC timing.
+     fn start_file(file: &str, cfg: &CaptureConfig) -> Result<CaptureSource> {
+-        let mut child = Command::new("ffmpeg")
++        let mut command = Command::new("ffmpeg");
++        if cfg.start_seconds > 0.0 {
++            command.args(["-ss", &cfg.start_seconds.to_string()]);
++        }
++        let mut child = command
+             // Keep the file source real-time, but make encoding predictable:
+             // an unbounded CRF/veryfast encode can produce bitrate bursts that
+             // fill the AirPlay receiver's queue and cause visible stutter.
+diff --git a/rust/airfry/src/daemon.rs b/rust/airfry/src/daemon.rs
+index 581af0b..1a9e7e7 100644
+--- a/rust/airfry/src/daemon.rs
++++ b/rust/airfry/src/daemon.rs
+@@ -876,6 +876,7 @@ impl Daemon {
+         // Start a fresh screen capture outside the lock (daemon.go: capture is
+         // built before re-acquiring d.mu).
+         let cap_cfg = CaptureConfig {
++            start_seconds: 0.0,
+             file: None,
+             fps: cfg.fps,
+             bitrate_kbps: cfg.bitrate_kbps,
+diff --git a/rust/airfry/src/main.rs b/rust/airfry/src/main.rs
+index 8ccebd7..4e8d8eb 100644
+--- a/rust/airfry/src/main.rs
++++ b/rust/airfry/src/main.rs
+@@ -182,6 +182,9 @@ fn parse_flags(args: &[String], start: usize) -> Result<CliFlags, String> {
+             "--file" => {
+                 f.opts.file = next(&mut i);
+             }
++            "--start" => {
++                f.opts.start_seconds = next(&mut i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0).max(0.0);
++            }
+             "--test-audio" => f.opts.test_audio = true,
+             "--pin" => {
+                 f.pin = next(&mut i).unwrap_or_default();
+diff --git a/rust/airfry/src/mirror.rs b/rust/airfry/src/mirror.rs
+index 3e5448d..d05d251 100644
+--- a/rust/airfry/src/mirror.rs
++++ b/rust/airfry/src/mirror.rs
+@@ -82,6 +82,8 @@ impl FrameSource for BroadcastSink {
+ /// Options for a mirror run.
+ #[derive(Clone, Debug)]
+ pub struct MirrorOpts {
++    /// Start position in seconds for local-file playback.
++    pub start_seconds: f64,
+     pub test_audio: bool,
+     pub file: Option<String>,
+     pub fit_pct: u8,
+@@ -119,6 +121,7 @@ pub struct MirrorOpts {
+ impl Default for MirrorOpts {
+     fn default() -> Self {
+         MirrorOpts {
++            start_seconds: 0.0,
+             test_audio: false,
+             file: None,
+             fit_pct: 0,
+@@ -1652,7 +1655,7 @@ pub fn run_mirror_with_source(
+                         let audio_capture = if opts.test_audio {
+                             audio::AudioCapture::start(true)
+                         } else if let Some(file) = opts.file.as_deref() {
+-                            audio::AudioCapture::start_file(file)
++                            audio::AudioCapture::start_file(file, opts.start_seconds)
+                         } else {
+                             audio::AudioCapture::start(opts.test)
+                         };
+@@ -1706,6 +1709,7 @@ pub fn run_mirror_with_source(
+         None => {
+             let capture_cfg = CaptureConfig {
+                 file: opts.file.clone(),
++                start_seconds: opts.start_seconds,
+                 fps: opts.fps,
+                 bitrate_kbps: opts.bitrate_kbps,
+                 fit_pct: opts.fit_pct,

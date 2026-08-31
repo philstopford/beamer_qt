@@ -82,6 +82,8 @@ impl FrameSource for BroadcastSink {
 /// Options for a mirror run.
 #[derive(Clone, Debug)]
 pub struct MirrorOpts {
+    /// Start position in seconds for local-file playback.
+    pub start_seconds: f64,
     pub test_audio: bool,
     pub file: Option<String>,
     pub fit_pct: u8,
@@ -119,6 +121,7 @@ pub struct MirrorOpts {
 impl Default for MirrorOpts {
     fn default() -> Self {
         MirrorOpts {
+            start_seconds: 0.0,
             test_audio: false,
             file: None,
             fit_pct: 0,
@@ -1652,7 +1655,7 @@ pub fn run_mirror_with_source(
                         let audio_capture = if opts.test_audio {
                             audio::AudioCapture::start(true)
                         } else if let Some(file) = opts.file.as_deref() {
-                            audio::AudioCapture::start_file(file)
+                            audio::AudioCapture::start_file(file, opts.start_seconds)
                         } else {
                             audio::AudioCapture::start(opts.test)
                         };
@@ -1706,6 +1709,7 @@ pub fn run_mirror_with_source(
         None => {
             let capture_cfg = CaptureConfig {
                 file: opts.file.clone(),
+                start_seconds: opts.start_seconds,
                 fps: opts.fps,
                 bitrate_kbps: opts.bitrate_kbps,
                 fit_pct: opts.fit_pct,

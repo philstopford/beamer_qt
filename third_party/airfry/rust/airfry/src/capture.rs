@@ -48,6 +48,7 @@ pub type RestoreTokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// pipeline actually uses).
 #[derive(Clone)]
 pub struct CaptureConfig {
+    pub start_seconds: f64,
     /// Optional local file. When set, FFmpeg supplies Annex-B H.264 frames.
     pub file: Option<String>,
     /// Target frame rate (defaults to 30 if 0).
@@ -95,6 +96,7 @@ impl std::fmt::Debug for CaptureConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         CaptureConfig {
+            start_seconds: 0.0,
             file: None,
             fps: 30,
             bitrate_kbps: 0,
@@ -214,7 +216,11 @@ impl CaptureSource {
     /// the existing AirPlay transport can then be validated independently of
     /// screen capture and AAC timing.
     fn start_file(file: &str, cfg: &CaptureConfig) -> Result<CaptureSource> {
-        let mut child = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        if cfg.start_seconds > 0.0 {
+            command.args(["-ss", &cfg.start_seconds.to_string()]);
+        }
+        let mut child = command
             // Keep the file source real-time, but make encoding predictable:
             // an unbounded CRF/veryfast encode can produce bitrate bursts that
             // fill the AirPlay receiver's queue and cause visible stutter.

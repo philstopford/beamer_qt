@@ -1,0 +1,202 @@
+diff --git a/rust/airfry/src/audio.rs b/rust/airfry/src/audio.rs
+index 32cc868..a2561ba 100644
+--- a/rust/airfry/src/audio.rs
++++ b/rust/airfry/src/audio.rs
+@@ -482,10 +482,17 @@ impl AudioCapture {
+     }
+ 
+     /// Read the selected local file's audio as the ALAC input format.
+-    pub fn start_file(path: &str) -> Result<AudioCapture> {
++    pub fn start_file(path: &str, start_seconds: f64) -> Result<AudioCapture> {
+         gst::init().context("gst init (file audio)")?;
+-        let mut child = std::process::Command::new("ffmpeg")
+-            .args(["-re", "-i", path, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-f", "s16le", "pipe:1"])
++        let mut command = std::process::Command::new("ffmpeg");
++        if start_seconds > 0.0 {
++            command.args(["-ss", &start_seconds.to_string()]);
++        }
++        let mut child = command
++            // The RTP loop below is the pacing clock. Using FFmpeg's -re as
++            // well would throttle the pipe and then throttle it a second
++            // time after each packet, causing periodic audio starvation.
++            .args(["-i", path, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-f", "s16le", "pipe:1"])
+             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn()
+             .context("start ffmpeg audio source")?;
+         let mut output = child.stdout.take().context("open ffmpeg audio output")?;
+@@ -992,10 +999,18 @@ pub fn stream_audio(
+     let mut retransmit_idx = 0usize;
+     let mut burst_done = false;
+     let mut frame_buf = vec![0u8; 8192];
++    let frame_period = Duration::from_nanos(
++        (AUDIO_SPF as u64 * 1_000_000_000) / AUDIO_SAMPLE_RATE as u64,
++    );
++    let mut next_audio_deadline = Instant::now();
+ 
+     // The capture started before video did; drop the stale backlog so audio
+     // lines up with video (audio.go DrainStale).
+-    capture.drain_stale();
++    // File capture is intentionally not drained: its fast FFmpeg producer
++    // queues the beginning of the soundtrack while RTSP/video negotiates.
++    if !capture.file_realtime {
++        capture.drain_stale();
++    }
+ 
+     loop {
+         if stop.load(Ordering::Relaxed) {
+@@ -1058,9 +1073,15 @@ pub fn stream_audio(
+         frame_seq = frame_seq.wrapping_add(1);
+         next_rtp = next_rtp.wrapping_add(spf);
+         if capture.file_realtime {
+-            // A pipe can deliver several FFmpeg audio buffers at once. Keep
+-            // AirPlay RTP timestamps aligned with wall-clock playback.
+-            std::thread::sleep(Duration::from_micros((AUDIO_SPF as u64 * 1_000_000) / AUDIO_SAMPLE_RATE as u64));
++            next_audio_deadline += frame_period;
++            let now = Instant::now();
++            if next_audio_deadline > now {
++                std::thread::sleep(next_audio_deadline - now);
++            } else {
++                // If encoding/networking briefly falls behind, re-anchor
++                // instead of trying to catch up with a burst of packets.
++                next_audio_deadline = now;
++            }
+         }
+ 
+         if frame_count <= 10 || frame_count % 100 == 0 {
+diff --git a/rust/airfry/src/capture.rs b/rust/airfry/src/capture.rs
+index 9106390..77eff08 100644
+--- a/rust/airfry/src/capture.rs
++++ b/rust/airfry/src/capture.rs
+@@ -48,6 +48,7 @@ pub type RestoreTokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
+ /// pipeline actually uses).
+ #[derive(Clone)]
+ pub struct CaptureConfig {
++    pub start_seconds: f64,
+     /// Optional local file. When set, FFmpeg supplies Annex-B H.264 frames.
+     pub file: Option<String>,
+     /// Target frame rate (defaults to 30 if 0).
+@@ -95,6 +96,7 @@ impl std::fmt::Debug for CaptureConfig {
+ impl Default for CaptureConfig {
+     fn default() -> Self {
+         CaptureConfig {
++            start_seconds: 0.0,
+             file: None,
+             fps: 30,
+             bitrate_kbps: 0,
+@@ -214,9 +216,20 @@ impl CaptureSource {
+     /// the existing AirPlay transport can then be validated independently of
+     /// screen capture and AAC timing.
+     fn start_file(file: &str, cfg: &CaptureConfig) -> Result<CaptureSource> {
+-        let mut child = Command::new("ffmpeg")
+-            .args(["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "veryfast",
+-                   "-tune", "zerolatency", "-f", "h264", "pipe:1"])
++        let mut command = Command::new("ffmpeg");
++        if cfg.start_seconds > 0.0 {
++            command.args(["-ss", &cfg.start_seconds.to_string()]);
++        }
++        let mut child = command
++            // Keep the file source real-time, but make encoding predictable:
++            // an unbounded CRF/veryfast encode can produce bitrate bursts that
++            // fill the AirPlay receiver's queue and cause visible stutter.
++            .args(["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "ultrafast",
++                   "-tune", "zerolatency", "-pix_fmt", "yuv420p",
++                   // Preserve the input cadence (24/25/29.97/30/50/60 FPS).
++                   "-fps_mode", "passthrough",
++                   "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
++                   "-f", "h264", "pipe:1"])
+             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+             .context("start ffmpeg file source")?;
+         let mut stdout = child.stdout.take().context("open ffmpeg output")?;
+diff --git a/rust/airfry/src/daemon.rs b/rust/airfry/src/daemon.rs
+index 581af0b..1a9e7e7 100644
+--- a/rust/airfry/src/daemon.rs
++++ b/rust/airfry/src/daemon.rs
+@@ -876,6 +876,7 @@ impl Daemon {
+         // Start a fresh screen capture outside the lock (daemon.go: capture is
+         // built before re-acquiring d.mu).
+         let cap_cfg = CaptureConfig {
++            start_seconds: 0.0,
+             file: None,
+             fps: cfg.fps,
+             bitrate_kbps: cfg.bitrate_kbps,
+diff --git a/rust/airfry/src/main.rs b/rust/airfry/src/main.rs
+index ee14df7..4e8d8eb 100644
+--- a/rust/airfry/src/main.rs
++++ b/rust/airfry/src/main.rs
+@@ -52,6 +52,8 @@ fn main() {
+     let code = match cmd {
+         "daemon" | "--daemonize" => cmd_daemon(&args),
+         "tray" => tray::run_tray(),
++        "discover-json" => cmd_discover_json(),
++        "credentials-check" => cmd_credentials_check(&args),
+         "discover" | "scan" => cmd_discover(&args),
+         "pair" => cmd_pair(&args),
+         "mirror" => cmd_mirror(&args),
+@@ -107,6 +109,20 @@ fn print_help() {
+     );
+ }
+ 
++fn cmd_discover_json() -> i32 {
++    match discovery::discover(Duration::from_secs(5)) {
++        Ok(devices) => { println!("{}", serde_json::to_string(&devices.iter().map(|d| serde_json::json!({"id": d.device_id, "name": d.name, "address": d.ip, "port": d.port})).collect::<Vec<_>>()).unwrap()); 0 }
++        Err(e) => { eprintln!("discovery failed: {e:#}"); 1 }
++    }
++}
++
++fn cmd_credentials_check(args: &[String]) -> i32 {
++    let Some(id) = args.get(2) else { eprintln!("usage: airfry credentials-check <device-id>"); return 2; };
++    let store = credentials::CredentialStore::open_default();
++    println!("{}", if store.lookup(id).is_some() { "paired" } else { "needs_pairing" });
++    0
++}
++
+ /// Parsed flags common to the `mirror` (and partly `pair`) subcommands, in the
+ /// shape doubletake's flag set defines them (main.go:51-69).
+ struct CliFlags {
+@@ -166,6 +182,9 @@ fn parse_flags(args: &[String], start: usize) -> Result<CliFlags, String> {
+             "--file" => {
+                 f.opts.file = next(&mut i);
+             }
++            "--start" => {
++                f.opts.start_seconds = next(&mut i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0).max(0.0);
++            }
+             "--test-audio" => f.opts.test_audio = true,
+             "--pin" => {
+                 f.pin = next(&mut i).unwrap_or_default();
+diff --git a/rust/airfry/src/mirror.rs b/rust/airfry/src/mirror.rs
+index 3e5448d..d05d251 100644
+--- a/rust/airfry/src/mirror.rs
++++ b/rust/airfry/src/mirror.rs
+@@ -82,6 +82,8 @@ impl FrameSource for BroadcastSink {
+ /// Options for a mirror run.
+ #[derive(Clone, Debug)]
+ pub struct MirrorOpts {
++    /// Start position in seconds for local-file playback.
++    pub start_seconds: f64,
+     pub test_audio: bool,
+     pub file: Option<String>,
+     pub fit_pct: u8,
+@@ -119,6 +121,7 @@ pub struct MirrorOpts {
+ impl Default for MirrorOpts {
+     fn default() -> Self {
+         MirrorOpts {
++            start_seconds: 0.0,
+             test_audio: false,
+             file: None,
+             fit_pct: 0,
+@@ -1652,7 +1655,7 @@ pub fn run_mirror_with_source(
+                         let audio_capture = if opts.test_audio {
+                             audio::AudioCapture::start(true)
+                         } else if let Some(file) = opts.file.as_deref() {
+-                            audio::AudioCapture::start_file(file)
++                            audio::AudioCapture::start_file(file, opts.start_seconds)
+                         } else {
+                             audio::AudioCapture::start(opts.test)
+                         };
+@@ -1706,6 +1709,7 @@ pub fn run_mirror_with_source(
+         None => {
+             let capture_cfg = CaptureConfig {
+                 file: opts.file.clone(),
++                start_seconds: opts.start_seconds,
+                 fps: opts.fps,
+                 bitrate_kbps: opts.bitrate_kbps,
+                 fit_pct: opts.fit_pct,

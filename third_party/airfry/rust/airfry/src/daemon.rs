@@ -876,6 +876,7 @@ impl Daemon {
         // Start a fresh screen capture outside the lock (daemon.go: capture is
         // built before re-acquiring d.mu).
         let cap_cfg = CaptureConfig {
+            start_seconds: 0.0,
             file: None,
             fps: cfg.fps,
             bitrate_kbps: cfg.bitrate_kbps,

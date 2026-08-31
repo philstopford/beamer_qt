@@ -182,6 +182,9 @@ fn parse_flags(args: &[String], start: usize) -> Result<CliFlags, String> {
             "--file" => {
                 f.opts.file = next(&mut i);
             }
+            "--start" => {
+                f.opts.start_seconds = next(&mut i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0).max(0.0);
+            }
             "--test-audio" => f.opts.test_audio = true,
             "--pin" => {
                 f.pin = next(&mut i).unwrap_or_default();

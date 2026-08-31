@@ -108,7 +108,7 @@ public:
         play = new QPushButton(tr("Beam"), central); play->setEnabled(false);
         pause = new QPushButton(tr("Pause"), central); pause->setEnabled(false);
         stop = new QPushButton(tr("Stop"), central); stop->setEnabled(false);
-        auto *progress = new QSlider(Qt::Horizontal, central); progress->setRange(0, 1000); progress->setEnabled(false);
+        progress = new QSlider(Qt::Horizontal, central); progress->setRange(0, 1000); progress->setEnabled(false);
         volume = new QSlider(Qt::Horizontal, central); volume->setRange(0, 100); volume->setValue(100); volume->setToolTip(tr("Volume"));
         controls->addWidget(play); controls->addWidget(pause); controls->addWidget(stop); controls->addWidget(progress, 1);
         controls->addWidget(new QLabel(tr("Volume"), central)); controls->addWidget(volume);
@@ -128,6 +128,19 @@ public:
             if (row >= 0 && row < found.size()) checkPairStatus(row);
         });
         connect(play, &QPushButton::clicked, this, [this] { beam(); });
+        connect(progress, &QSlider::sliderPressed, this, [this] { seeking = true; });
+        connect(progress, &QSlider::sliderReleased, this, [this] {
+            seeking = false;
+            if (durationSeconds <= 0 || deviceList->currentRow() < 0 || found[deviceList->currentRow()].kind != DeviceKind::AppleTV) return;
+            seekTo(progress->value() * durationSeconds / 1000.0);
+        });
+        playbackTimer = new QTimer(this);
+        connect(playbackTimer, &QTimer::timeout, this, [this] {
+            if (!seeking && process && process->state() == QProcess::Running && durationSeconds > 0) {
+                elapsedSeconds += 0.25;
+                progress->setValue(qBound(0, int(elapsedSeconds / durationSeconds * 1000.0), 1000));
+            }
+        });
         connect(stop, &QPushButton::clicked, this, [this] { if (process) process->kill(); });
         connect(pause, &QPushButton::clicked, this, [this] {
 #ifdef Q_OS_UNIX
@@ -188,6 +201,9 @@ private:
         fileLabel->setText(QFileInfo(path).fileName());
         fileLabel->setToolTip(path);
         selectedPath = path;
+        durationSeconds = 0;
+        elapsedSeconds = 0;
+        progress->setValue(0); progress->setEnabled(false);
         inspectTracks(path);
         if (!server) server = new MediaServer(this);
         if (!server->isListening() && !server->serve(path)) {
@@ -219,6 +235,16 @@ private:
             probe->deleteLater();
         });
         probe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "quiet", "-print_format", "json", "-show_streams", path});
+        auto *durationProbe = new QProcess(this);
+        connect(durationProbe, &QProcess::finished, this, [this, durationProbe](int code, QProcess::ExitStatus) {
+            if (code == 0) {
+                const auto object = QJsonDocument::fromJson(durationProbe->readAllStandardOutput()).object();
+                durationSeconds = object.value("format").toObject().value("duration").toDouble();
+                progress->setEnabled(durationSeconds > 0);
+            }
+            durationProbe->deleteLater();
+        });
+        durationProbe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "quiet", "-print_format", "json", "-show_format", path});
     }
     void discover() {
         found.clear(); deviceList->clear(); deviceList->addItem(tr("Searching…"));
@@ -365,12 +391,13 @@ private:
                 // Keep the stable video path isolated while file-audio
                 // negotiation is validated independently.
                 QStringList airplayArgs{"mirror", device.address.toString(), "--file", selectedPath, "--sw", "--debug"};
+                if (seekSeconds > 0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
                 // File audio is streamed by AirFry alongside the video. Set
                 // BEAMER_NO_AUDIO=1 only when video-only playback is desired.
                 if (qEnvironmentVariableIsSet("BEAMER_NO_AUDIO")) airplayArgs << "--no-audio";
                 if (qEnvironmentVariableIsSet("BEAMER_TEST_AUDIO")) airplayArgs << "--test-audio";
                 process->start(airfry, airplayArgs);
-                if (process->waitForStarted(1000)) { paused = false; pause->setText(tr("Pause")); statusBar()->showMessage(tr("Sending local video to %1…").arg(device.name)); return; }
+                if (process->waitForStarted(1000)) { paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Sending local video to %1…").arg(device.name)); return; }
             }
             const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
             if (!QFileInfo::exists(script)) { statusBar()->showMessage(tr("Apple TV backend is not installed")); return; }
@@ -395,10 +422,18 @@ private:
         if (!process->waitForStarted(1000)) statusBar()->showMessage(tr("Chromecast backend unavailable: build beamer-chromecast"));
         else statusBar()->showMessage(tr("Sending video to %1…").arg(device.name));
     }
+    void seekTo(double seconds) {
+        if (found.isEmpty() || !process || process->state() != QProcess::Running) return;
+        process->kill();
+        process->waitForFinished(1000);
+        seekSeconds = seconds; elapsedSeconds = seconds;
+        beamNow();
+        seekSeconds = 0;
+    }
     QLabel *fileLabel{};
     QListWidget *deviceList{};
     QPushButton *browse{}, *play{}, *pause{}, *stop{}, *pair{};
-    QSlider *volume{};
+    QSlider *progress{}, *volume{};
     QComboBox *audioTrack{}, *subtitleTrack{};
     QList<Device> found;
     QString selectedPath;
@@ -407,6 +442,9 @@ private:
     QProcess *process{};
     QProcess *ffmpeg{};
     bool paused{};
+    QTimer *playbackTimer{};
+    double durationSeconds{}, elapsedSeconds{}, seekSeconds{};
+    bool seeking{};
 };
 
 int main(int argc, char **argv) {

@@ -482,9 +482,13 @@ impl AudioCapture {
     }
 
     /// Read the selected local file's audio as the ALAC input format.
-    pub fn start_file(path: &str) -> Result<AudioCapture> {
+    pub fn start_file(path: &str, start_seconds: f64) -> Result<AudioCapture> {
         gst::init().context("gst init (file audio)")?;
-        let mut child = std::process::Command::new("ffmpeg")
+        let mut command = std::process::Command::new("ffmpeg");
+        if start_seconds > 0.0 {
+            command.args(["-ss", &start_seconds.to_string()]);
+        }
+        let mut child = command
             // The RTP loop below is the pacing clock. Using FFmpeg's -re as
             // well would throttle the pipe and then throttle it a second
             // time after each packet, causing periodic audio starvation.
