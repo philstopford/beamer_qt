@@ -215,8 +215,15 @@ impl CaptureSource {
     /// screen capture and AAC timing.
     fn start_file(file: &str, cfg: &CaptureConfig) -> Result<CaptureSource> {
         let mut child = Command::new("ffmpeg")
-            .args(["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "veryfast",
-                   "-tune", "zerolatency", "-f", "h264", "pipe:1"])
+            // Keep the file source real-time, but make encoding predictable:
+            // an unbounded CRF/veryfast encode can produce bitrate bursts that
+            // fill the AirPlay receiver's queue and cause visible stutter.
+            .args(["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "ultrafast",
+                   "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+                   // Preserve the input cadence (24/25/29.97/30/50/60 FPS).
+                   "-fps_mode", "passthrough",
+                   "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
+                   "-f", "h264", "pipe:1"])
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
             .context("start ffmpeg file source")?;
         let mut stdout = child.stdout.take().context("open ffmpeg output")?;

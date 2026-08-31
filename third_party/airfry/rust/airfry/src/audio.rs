@@ -485,7 +485,10 @@ impl AudioCapture {
     pub fn start_file(path: &str) -> Result<AudioCapture> {
         gst::init().context("gst init (file audio)")?;
         let mut child = std::process::Command::new("ffmpeg")
-            .args(["-re", "-i", path, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-f", "s16le", "pipe:1"])
+            // The RTP loop below is the pacing clock. Using FFmpeg's -re as
+            // well would throttle the pipe and then throttle it a second
+            // time after each packet, causing periodic audio starvation.
+            .args(["-i", path, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-f", "s16le", "pipe:1"])
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn()
             .context("start ffmpeg audio source")?;
         let mut output = child.stdout.take().context("open ffmpeg audio output")?;
@@ -992,10 +995,18 @@ pub fn stream_audio(
     let mut retransmit_idx = 0usize;
     let mut burst_done = false;
     let mut frame_buf = vec![0u8; 8192];
+    let frame_period = Duration::from_nanos(
+        (AUDIO_SPF as u64 * 1_000_000_000) / AUDIO_SAMPLE_RATE as u64,
+    );
+    let mut next_audio_deadline = Instant::now();
 
     // The capture started before video did; drop the stale backlog so audio
     // lines up with video (audio.go DrainStale).
-    capture.drain_stale();
+    // File capture is intentionally not drained: its fast FFmpeg producer
+    // queues the beginning of the soundtrack while RTSP/video negotiates.
+    if !capture.file_realtime {
+        capture.drain_stale();
+    }
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1058,9 +1069,15 @@ pub fn stream_audio(
         frame_seq = frame_seq.wrapping_add(1);
         next_rtp = next_rtp.wrapping_add(spf);
         if capture.file_realtime {
-            // A pipe can deliver several FFmpeg audio buffers at once. Keep
-            // AirPlay RTP timestamps aligned with wall-clock playback.
-            std::thread::sleep(Duration::from_micros((AUDIO_SPF as u64 * 1_000_000) / AUDIO_SAMPLE_RATE as u64));
+            next_audio_deadline += frame_period;
+            let now = Instant::now();
+            if next_audio_deadline > now {
+                std::thread::sleep(next_audio_deadline - now);
+            } else {
+                // If encoding/networking briefly falls behind, re-anchor
+                // instead of trying to catch up with a burst of packets.
+                next_audio_deadline = now;
+            }
         }
 
         if frame_count <= 10 || frame_count % 100 == 0 {

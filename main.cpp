@@ -323,6 +323,13 @@ private:
     void beam() {
         const int row = deviceList->currentRow();
         if (!server || row < 0 || row >= found.size()) return;
+        // AirFry reads and encodes the original file incrementally. The
+        // track-remux below is only needed for Chromecast's HTTP playback;
+        // doing it first would add a full-file delay on Apple TV.
+        if (found[row].kind == DeviceKind::AppleTV) {
+            beamNow();
+            return;
+        }
         if (audioTrack->count() > 0 && audioTrack->currentData().isValid()) {
             const auto output = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation)).filePath("beamer-selected.mp4");
             QStringList args{"-y", "-i", selectedPath, "-map", "0:v:0", "-map", QString("0:%1").arg(audioTrack->currentData().toInt()), "-c:v", "copy", "-c:a", "aac"};
@@ -358,7 +365,9 @@ private:
                 // Keep the stable video path isolated while file-audio
                 // negotiation is validated independently.
                 QStringList airplayArgs{"mirror", device.address.toString(), "--file", selectedPath, "--sw", "--debug"};
-                if (!qEnvironmentVariableIsSet("BEAMER_FILE_AUDIO") && !qEnvironmentVariableIsSet("BEAMER_TEST_AUDIO")) airplayArgs << "--no-audio";
+                // File audio is streamed by AirFry alongside the video. Set
+                // BEAMER_NO_AUDIO=1 only when video-only playback is desired.
+                if (qEnvironmentVariableIsSet("BEAMER_NO_AUDIO")) airplayArgs << "--no-audio";
                 if (qEnvironmentVariableIsSet("BEAMER_TEST_AUDIO")) airplayArgs << "--test-audio";
                 process->start(airfry, airplayArgs);
                 if (process->waitForStarted(1000)) { paused = false; pause->setText(tr("Pause")); statusBar()->showMessage(tr("Sending local video to %1…").arg(device.name)); return; }
