@@ -7,7 +7,7 @@ set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 
-qt_add_executable(beamer_qt main.cpp device.cpp media_server.cpp)
+qt_add_executable(beamer_qt main.cpp device.cpp media_server.cpp media_preparer.cpp)
 target_link_libraries(beamer_qt PRIVATE Qt6::Widgets Qt6::Network)
 
 enable_testing()
@@ -30,6 +30,7 @@ add_custom_target(native_backends ALL
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building native AirPlay and Chromecast backends"
 )
+add_dependencies(beamer_qt native_backends)
 
 set_target_properties(beamer_qt PROPERTIES
     WIN32_EXECUTABLE TRUE

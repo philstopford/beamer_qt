@@ -216,20 +216,19 @@ impl CaptureSource {
     /// the existing AirPlay transport can then be validated independently of
     /// screen capture and AAC timing.
     fn start_file(file: &str, cfg: &CaptureConfig) -> Result<CaptureSource> {
+        let (width, height, source_fps, codec, pix_fmt) = Self::probe_file_video(file).unwrap_or((1920, 1080, 30.0, String::new(), String::new()));
+        let bitrate = if cfg.bitrate_kbps > 0 { cfg.bitrate_kbps } else { (((width as u64 * height as u64 * source_fps.max(1.0) as u64) / 15_000) as u32).clamp(1800, 12_000) };
         let mut command = Command::new("ffmpeg");
         if cfg.start_seconds > 0.0 {
             command.args(["-ss", &cfg.start_seconds.to_string()]);
         }
+        let direct_h264 = codec == "h264" && (pix_fmt.is_empty() || pix_fmt == "yuv420p");
+        let ffmpeg_args: Vec<String> = if direct_h264 { vec!["-re", "-i", file, "-an", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-fps_mode", "passthrough", "-f", "h264", "pipe:1"].into_iter().map(String::from).collect() } else { vec!["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-b:v", &format!("{}k", bitrate), "-maxrate", &format!("{}k", bitrate), "-bufsize", &format!("{}k", bitrate.saturating_mul(2)), "-f", "h264", "pipe:1"].into_iter().map(String::from).collect() };
         let mut child = command
             // Keep the file source real-time, but make encoding predictable:
             // an unbounded CRF/veryfast encode can produce bitrate bursts that
             // fill the AirPlay receiver's queue and cause visible stutter.
-            .args(["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "ultrafast",
-                   "-tune", "zerolatency", "-pix_fmt", "yuv420p",
-                   // Preserve the input cadence (24/25/29.97/30/50/60 FPS).
-                   "-fps_mode", "passthrough",
-                   "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
-                   "-f", "h264", "pipe:1"])
+            .args(ffmpeg_args)
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
             .context("start ffmpeg file source")?;
         let mut stdout = child.stdout.take().context("open ffmpeg output")?;
@@ -246,8 +245,18 @@ impl CaptureSource {
             }
             *eos_thread.lock().unwrap() = true;
         });
-        let _ = cfg;
+        crate::dlog!("[CAPTURE] file mode={} codec={} pix_fmt={} source={}x{}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, codec, pix_fmt, width, height);
         Ok(CaptureSource { pipeline: gst::Pipeline::new(), rx, leftover: Vec::new(), _portal: None, eos, live_fit: None, child: Some(child) })
+    }
+
+    fn probe_file_video(file: &str) -> Result<(u32, u32, f64, String, String)> {
+        let output = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,r_frame_rate,codec_name,pix_fmt", "-of", "csv=p=0", file]).output().context("probe file video")?;
+        if !output.status.success() { bail!("ffprobe failed") }
+        let fields: Vec<&str> = std::str::from_utf8(&output.stdout)?.trim().split(',').collect();
+        if fields.len() < 5 { bail!("incomplete video probe") }
+        let width = fields[0].parse()?; let height = fields[1].parse()?;
+        let mut fps = fields[2].split('/'); let n: f64 = fps.next().unwrap_or("30").parse()?; let d: f64 = fps.next().unwrap_or("1").parse()?;
+        Ok((width, height, if d > 0.0 { n / d } else { 30.0 }, fields[3].to_string(), fields[4].to_string()))
     }
 
     /// StartTestCapture (capture.go:484-553) — synthetic H.264 stream from

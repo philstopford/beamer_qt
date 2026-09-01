@@ -180,6 +180,7 @@ pub fn parse_port_range(s: &str) -> Result<Option<(u16, u16)>> {
 #[derive(Clone)]
 pub struct MirrorControl {
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     /// Desired mute state. Seeded from `MirrorOpts.mute_audio` at setup and
     /// updated by `set_muted`.
     muted: Arc<AtomicBool>,
@@ -212,6 +213,7 @@ impl MirrorControl {
     pub fn with_stop(stop: Arc<AtomicBool>) -> Self {
         MirrorControl {
             stop,
+            paused: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
             chan: Arc::new(Mutex::new(None)),
             fit: Arc::new(Mutex::new(None)),
@@ -227,6 +229,7 @@ impl MirrorControl {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+    pub fn set_paused(&self, paused: bool) { self.paused.store(paused, Ordering::Relaxed); }
 
     /// Current desired mute state.
     pub fn is_muted(&self) -> bool {
@@ -247,6 +250,15 @@ impl MirrorControl {
                 .request("SET_PARAMETER", &ch.audio_uri, "text/parameters", body, &[])
                 .map_err(|e| anyhow!("set audio muted={muted}: {e}"))?;
         }
+        Ok(())
+    }
+
+    /// Set AirPlay volume from 0.0 (muted) to 1.0 (full scale).
+    pub fn set_volume(&self, level: f64) -> Result<()> {
+        let db = if level <= 0.0 { -144.0 } else { 20.0 * level.clamp(0.000001, 1.0).log10() };
+        let body = format!("volume: {db:.6}\r\n");
+        let guard = self.chan.lock().unwrap();
+        if let Some(ch) = guard.as_ref() { ch.control.lock().unwrap().request("SET_PARAMETER", &ch.audio_uri, "text/parameters", body.as_bytes(), &[]).map_err(|e| anyhow!("set volume: {e}"))?; }
         Ok(())
     }
 
@@ -1633,7 +1645,7 @@ pub fn run_mirror_with_source(
     // flags as video (mirror.go: setupAudioStream is created after RECORD and
     // StreamAudio is launched alongside StreamFrames). ----
     let mut audio_handle: Option<std::thread::JoinHandle<()>> = None;
-    if !opts.no_audio {
+    if !opts.no_audio && session.info.supports_alac() {
         if let (Some(ctrl_conn), Some(data_conn)) = (audio_ctrl_conn, audio_data_conn) {
             if audio_data_port > 0 {
                 let audio_ct = audio::AUDIO_CT_ALAC;
@@ -1691,6 +1703,8 @@ pub fn run_mirror_with_source(
                 crate::dlog!("[audio] receiver did not provide audio ports; skipping audio");
             }
         }
+    } else if !opts.no_audio {
+        crate::dlog!("[audio] receiver does not advertise ALAC; continuing video-only");
     } else {
         crate::dlog!("[audio] disabled (--no-audio)");
     }
@@ -1704,7 +1718,7 @@ pub fn run_mirror_with_source(
     let result = match source {
         Some(mut src) => {
             crate::dlog!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
-            stream_frames(src.as_mut(), &data, &first_frame, &stop)
+            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused)
         }
         None => {
             let capture_cfg = CaptureConfig {
@@ -1726,7 +1740,7 @@ pub fn run_mirror_with_source(
                 control_handle.bind_fit(lf);
             }
             crate::dlog!("[mirror] streaming… (Ctrl-C to stop)");
-            let r = stream_frames(&mut capture, &data, &first_frame, &stop);
+            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused);
             owned_capture = Some(capture);
             r
         }
@@ -2204,6 +2218,7 @@ fn stream_frames(
     data: &Arc<Mutex<DataChannel>>,
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut parser = H264Parser::new();
@@ -2216,11 +2231,18 @@ fn stream_frames(
     let mut stream_primed = false;
     let mut frame_count: i64 = 0;
     let mut cc = CongestionController::new();
+    let mut paused_frame: Option<Vec<u8>> = None;
 
     // Closure-free flush implemented inline via a helper fn would need many
     // params; keep it a local macro-like block.
-    macro_rules! flush_vcl {
-        () => {{
+            macro_rules! flush_vcl {
+            () => {{
+                if paused.load(Ordering::Relaxed) {
+                    if paused_frame.is_none() && (!pending_keyframe || vcl_buf.is_empty()) { vcl_buf.clear(); return Ok(()); }
+                    let frame = paused_frame.get_or_insert_with(|| vcl_buf.clone());
+                    let ntp = data.lock().unwrap().ntp_time_now(); data.lock().unwrap().send_frame(frame, true, ntp)?;
+                    vcl_buf.clear(); return Ok(());
+                }
             let res: Result<()> = (|| {
                 if vcl_buf.is_empty() {
                     return Ok(());

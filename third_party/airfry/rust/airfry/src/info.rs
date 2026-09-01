@@ -50,6 +50,10 @@ pub struct ReceiverInfo {
     pub pi: String,
     pub mac_address: String,
     pub displays: Vec<DisplayInfo>,
+    /// Numeric audio format identifiers advertised by `/info` (when present).
+    /// The mirrored ALAC format is 0x40000; absent means the receiver uses the
+    /// legacy implicit capability contract and is treated as compatible.
+    pub audio_formats: Vec<i64>,
 }
 
 impl ReceiverInfo {
@@ -79,6 +83,10 @@ impl ReceiverInfo {
     /// implementations do not).
     pub fn supports_fairplay_sap(&self) -> bool {
         self.features & crate::discovery::FEATURE_FPSAP25 != 0
+    }
+
+    pub fn supports_alac(&self) -> bool {
+        self.audio_formats.is_empty() || self.audio_formats.iter().any(|f| *f == 0x40000 || *f == 2)
     }
 
     /// Minimum playout lead this receiver needs. Port of
@@ -181,6 +189,12 @@ fn parse_info(body: &[u8]) -> Result<ReceiverInfo> {
                 width_pixels: dd.get("widthPixels").and_then(as_i64).unwrap_or(0),
                 height_pixels: dd.get("heightPixels").and_then(as_i64).unwrap_or(0),
             });
+        }
+    }
+    for key in ["audioFormats", "supportedAudioFormatsExtended"] {
+        if let Some(arr) = dict.get(key).and_then(|v| v.as_array()) {
+            for value in arr { if let Some(n) = as_i64(value) { info.audio_formats.push(n); } }
+            if !info.audio_formats.is_empty() { break; }
         }
     }
 

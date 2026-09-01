@@ -19,6 +19,7 @@ mod icon;
 mod info;
 mod latency;
 mod mirror;
+mod media;
 mod pairing;
 mod playfair;
 mod protocol;
@@ -53,10 +54,12 @@ fn main() {
         "daemon" | "--daemonize" => cmd_daemon(&args),
         "tray" => tray::run_tray(),
         "discover-json" => cmd_discover_json(),
+        "probe" => cmd_probe(&args),
         "credentials-check" => cmd_credentials_check(&args),
         "discover" | "scan" => cmd_discover(&args),
         "pair" => cmd_pair(&args),
         "mirror" => cmd_mirror(&args),
+        "media" => cmd_media(&args),
         "version" | "--version" | "-V" => {
             println!("airfry {}", env!("CARGO_PKG_VERSION"));
             0
@@ -79,7 +82,9 @@ fn print_help() {
          USAGE:\n  \
            airfry discover                Scan the network for AirPlay receivers\n  \
            airfry pair [host[:port]]      Connect + pair + fp-setup against a receiver\n  \
+           airfry probe <host>             Query receiver /info capabilities (no pairing)\n  \
            airfry mirror [host[:port]]    Mirror this screen to the receiver\n  \
+           airfry media <host[:port]> --url <url>  Play a URL using native AirPlay media\n  \
            airfry version                 Print version\n\n\
          When no host is given to `pair`/`mirror`/`discover`, a numbered device\n  \
          picker is shown (read a selection from stdin).\n\n\
@@ -107,6 +112,43 @@ fn print_help() {
            --socket <path>        Unix socket path for the daemon control interface",
         ver = env!("CARGO_PKG_VERSION")
     );
+}
+
+fn cmd_media(args: &[String]) -> i32 {
+    let Some(target) = args.get(2).filter(|v| !v.starts_with('-')) else { eprintln!("usage: airfry media <host[:port]> --url <url> [--start seconds]"); return 2; };
+    let (host, port) = match parse_target(target) { Ok(v) => v, Err(e) => { eprintln!("{e}"); return 2; } };
+    let mut url = None; let mut start = 0.0; let mut i = 3;
+    while i < args.len() { match args[i].as_str() { "--url" => { i += 1; url = args.get(i).cloned(); }, "--start" => { i += 1; start = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0.0); }, _ => {} } i += 1; }
+    let Some(url) = url else { eprintln!("missing --url"); return 2; };
+    let mut report = |phase: &str, ok: bool, detail: &str| { eprintln!("[{}] {phase}: {detail}", if ok { "OK" } else { "FAIL" }); };
+    let mut ask = ask_pin;
+    let session = match rtsp::Session::connect_host_with(&host, port, "", &rtsp::ConnectOptions::default(), &mut ask, &mut report) { Ok(s) => s, Err(e) => { eprintln!("media pairing failed: {e:#}"); return 1; } };
+    match media::run(session, &url, start) { Ok(()) => 0, Err(e) => { eprintln!("media failed: {e:#}"); 1 } }
+}
+
+fn cmd_probe(args: &[String]) -> i32 {
+    let Some(host) = args.get(2) else { eprintln!("usage: airfry probe <host> [port]"); return 2; };
+    let port = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(7000);
+    match rtsp::Transport::connect(host, port).and_then(|mut t| info::get_info(&mut t)) {
+        Ok(i) => {
+            let (w, h) = i.display_size();
+            println!("receiver.name={}
+receiver.model={}
+capability.display_resolution={}
+capability.4k={}
+capability.hdr={}
+capability.audio.alac={}
+capability.audio.5.1=unknown (receiver supplied no channel-layout data)
+capability.audio.formats={:?}
+capability.features=0x{:016x}", i.name, i.model,
+                if w > 0 { format!("{}x{} (confirmed)", w, h) } else { "unknown (not advertised)".into() },
+                if i.hdr_capability.to_ascii_lowercase().contains("4k") { "likely (HDR field says 4K)" } else { "unknown" },
+                if i.hdr_capability.is_empty() { "unknown" } else { &i.hdr_capability },
+                if i.supports_alac() { "yes (negotiated/default)" } else { "no" }, i.audio_formats, i.features);
+            0
+        }
+        Err(e) => { eprintln!("probe failed: {e:#}"); 1 }
+    }
 }
 
 fn cmd_discover_json() -> i32 {
@@ -494,6 +536,22 @@ fn cmd_mirror(args: &[String]) -> i32 {
     let stop = Arc::new(AtomicBool::new(false));
     let control = MirrorControl::with_stop(stop.clone());
     install_signal_handler(control.clone());
+    let input_control = control.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines().flatten() {
+            let mut parts = line.split_whitespace();
+            match parts.next() {
+                Some("volume") => { if let Some(value) = parts.next().and_then(|v| v.parse::<f64>().ok()) { let _ = input_control.set_volume(value); } }
+                Some("mute") => { let _ = input_control.set_muted(true); }
+                Some("unmute") => { let _ = input_control.set_muted(false); }
+                Some("pause") => input_control.set_paused(true),
+                Some("resume") => input_control.set_paused(false),
+                Some("stop") => input_control.stop(),
+                _ => {}
+            }
+        }
+    });
 
     match mirror::run_mirror_with_control(session, flags.opts, control) {
         Ok(()) => {

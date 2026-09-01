@@ -25,11 +25,19 @@
 #include <QDir>
 #include <QInputDialog>
 #include <QStandardPaths>
+#include <QTextEdit>
+#include <QTcpSocket>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QHash>
+#include <QSettings>
+#include <QRegularExpression>
 #ifdef Q_OS_UNIX
 #include <signal.h>
 #endif
 #include "device.h"
 #include "media_server.h"
+#include "media_preparer.h"
 #include <functional>
 
 class DropZone final : public QFrame {
@@ -89,6 +97,22 @@ public:
         trackLayout->addWidget(audioTrack, 1); trackLayout->addWidget(subtitleTrack, 1);
         root->addWidget(tracks);
 
+        auto *backendRow = new QHBoxLayout;
+        backendRow->addWidget(new QLabel(tr("Apple TV backend:"), central));
+        appleTvBackend = new QComboBox(central);
+        appleTvBackend->addItem(tr("Mirror (stable fallback)"), "mirror");
+        appleTvBackend->addItem(tr("Direct media (HEVC/HDR/seek)"), "direct");
+        appleTvBackend->setCurrentIndex(appleTvBackend->findData(qEnvironmentVariable("BEAMER_APPLETV_BACKEND", "mirror")));
+        backendRow->addWidget(appleTvBackend); backendRow->addStretch();
+        root->addLayout(backendRow);
+
+        auto *encoderRow = new QHBoxLayout;
+        encoderRow->addWidget(new QLabel(tr("Transcode encoder:"), central));
+        videoEncoder = new QComboBox(central);
+        populateEncoders();
+        encoderRow->addWidget(videoEncoder); encoderRow->addStretch();
+        root->addLayout(encoderRow);
+
         auto *devices = new QGroupBox(tr("Devices on this network"), central);
         auto *deviceLayout = new QVBoxLayout(devices);
         auto *deviceToolbar = new QHBoxLayout;
@@ -103,6 +127,19 @@ public:
         auto *refresh = new QPushButton(tr("Refresh devices"), devices);
         deviceLayout->addWidget(refresh);
         root->addWidget(devices, 1);
+
+        auto *debug = new QGroupBox(tr("Debug diagnostics"), central);
+        auto *debugLayout = new QVBoxLayout(debug);
+        auto *debugButtons = new QHBoxLayout;
+        auto *runProbe = new QPushButton(tr("Probe input"), debug);
+        auto *runHttp = new QPushButton(tr("Test HTTP ranges"), debug);
+        auto *runDevice = new QPushButton(tr("Test selected device"), debug);
+        auto *clearDebug = new QPushButton(tr("Clear"), debug);
+        debugButtons->addWidget(runProbe); debugButtons->addWidget(runHttp); debugButtons->addWidget(runDevice); debugButtons->addStretch(); debugButtons->addWidget(clearDebug);
+        debugLayout->addLayout(debugButtons);
+        debugLog = new QTextEdit(debug); debugLog->setReadOnly(true); debugLog->setMinimumHeight(110); debugLog->setPlaceholderText(tr("Diagnostics are non-destructive. Select a file/device, then run a test."));
+        debugLayout->addWidget(debugLog);
+        root->addWidget(debug);
 
         auto *controls = new QHBoxLayout;
         play = new QPushButton(tr("Beam"), central); play->setEnabled(false);
@@ -122,6 +159,11 @@ public:
             if (!path.isEmpty()) selectFile(path);
         });
         connect(refresh, &QPushButton::clicked, this, [this] { discover(); });
+        connect(volume, &QSlider::valueChanged, this, [this](int value) { setReceiverVolume(value); });
+        connect(clearDebug, &QPushButton::clicked, this, [this] { debugLog->clear(); });
+        connect(runProbe, &QPushButton::clicked, this, [this] { runProbeTest(); });
+        connect(runHttp, &QPushButton::clicked, this, [this] { runHttpTest(); });
+        connect(runDevice, &QPushButton::clicked, this, [this] { runDeviceTest(); });
         connect(deviceList, &QListWidget::currentRowChanged, this, [this](int row) {
             const bool ready = row >= 0 && row < found.size() && !selectedPath.isEmpty();
             play->setEnabled(ready); pause->setEnabled(ready); stop->setEnabled(ready); pair->setEnabled(row >= 0 && row < found.size());
@@ -131,7 +173,8 @@ public:
         connect(progress, &QSlider::sliderPressed, this, [this] { seeking = true; });
         connect(progress, &QSlider::sliderReleased, this, [this] {
             seeking = false;
-            if (durationSeconds <= 0 || deviceList->currentRow() < 0 || found[deviceList->currentRow()].kind != DeviceKind::AppleTV) return;
+            if (deviceList->currentRow() < 0 || found[deviceList->currentRow()].kind != DeviceKind::AppleTV) return;
+            if (durationSeconds <= 0) { statusBar()->showMessage(tr("Cannot seek: input has no usable duration metadata")); return; }
             seekTo(progress->value() * durationSeconds / 1000.0);
         });
         playbackTimer = new QTimer(this);
@@ -145,6 +188,9 @@ public:
         connect(pause, &QPushButton::clicked, this, [this] {
 #ifdef Q_OS_UNIX
             if (process && process->state() == QProcess::Running) {
+                if (deviceList->currentRow() >= 0 && deviceList->currentRow() < found.size() && found[deviceList->currentRow()].kind == DeviceKind::AppleTV) {
+                    process->write((paused ? "resume\n" : "pause\n")); paused = !paused; pause->setText(paused ? tr("Resume") : tr("Pause")); statusBar()->showMessage(paused ? tr("Playback paused") : tr("Playback resumed")); return;
+                }
                 const int sig = paused ? SIGCONT : SIGSTOP;
                 if (::kill(static_cast<pid_t>(process->processId()), sig) == 0) {
                     paused = !paused; pause->setText(paused ? tr("Resume") : tr("Pause"));
@@ -197,13 +243,74 @@ public:
     }
 
 private:
+    void populateEncoders() {
+        QProcess probe;
+        probe.start(qEnvironmentVariable("BEAMER_FFMPEG", "ffmpeg"), {"-hide_banner", "-encoders"});
+        const QString text = probe.waitForFinished(2500) ? QString::fromLocal8Bit(probe.readAllStandardOutput()) : QString();
+        const auto has = [&text](const QString &name) { return text.contains(QRegularExpression(QStringLiteral("\\s") + QRegularExpression::escape(name) + QStringLiteral("\\s"))); };
+        videoEncoder->addItem(tr("CPU (automatic codec)"), "cpu");
+        if (has("h264_nvenc") && has("hevc_nvenc")) videoEncoder->addItem(tr("NVIDIA NVENC (automatic codec)"), "nvenc");
+        QSettings settings;
+        const auto wanted = qEnvironmentVariable("BEAMER_VIDEO_ENCODER", settings.value("encoding/videoEncoder", "libx264").toString());
+        const int index = videoEncoder->findData(wanted == "nvenc" ? "nvenc" : "cpu");
+        videoEncoder->setCurrentIndex(index >= 0 ? index : 0);
+        connect(videoEncoder, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+            QSettings().setValue("encoding/videoEncoder", videoEncoder->currentData());
+        });
+    }
+    QString selectedVideoEncoder(bool chromecast) const {
+        const bool hevc = videoCodec.contains("hevc", Qt::CaseInsensitive) || videoCodec.contains("h265", Qt::CaseInsensitive);
+        const bool nvenc = videoEncoder && videoEncoder->currentData().toString() == "nvenc";
+        Q_UNUSED(chromecast);
+        if (nvenc) return hevc ? QStringLiteral("hevc_nvenc") : QStringLiteral("h264_nvenc");
+        return hevc ? QStringLiteral("libx265") : QStringLiteral("libx264");
+    }
+    void setReceiverVolume(int value) {
+        const int row = deviceList->currentRow(); if (row < 0 || row >= found.size()) return;
+        const auto &d = found[row]; if (d.kind == DeviceKind::AppleTV) { if (process && process->state() == QProcess::Running) process->write("volume " + QByteArray::number(value / 100.0, 'f', 3) + "\n"); return; }
+        if (volumeProcess) { volumeProcess->kill(); volumeProcess->deleteLater(); }
+        volumeProcess = new QProcess(this);
+        const auto helper = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
+        connect(volumeProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) { if (code != 0) debug(tr("FAIL volume: %1").arg(QString::fromLocal8Bit(volumeProcess->readAllStandardError()).trimmed())); volumeProcess->deleteLater(); volumeProcess = nullptr; });
+        volumeProcess->start(helper, {"volume", d.address.toString(), QString::number(value / 100.0, 'f', 2)});
+    }
+    void debug(const QString &message) { debugLog->append(QDateTime::currentDateTime().toString("HH:mm:ss ") + message); }
+    void runProbeTest() {
+        if (selectedPath.isEmpty()) { debug(tr("FAIL probe: select an input file first")); return; }
+        auto *p = new QProcess(this); debug(tr("RUN probe: %1").arg(QFileInfo(selectedPath).fileName()));
+        connect(p, &QProcess::finished, this, [this, p](int code, QProcess::ExitStatus) { const auto out = QString::fromLocal8Bit(p->readAllStandardOutput()).trimmed(); debug((code == 0 ? tr("PASS probe: ") : tr("FAIL probe: ")) + out.left(1200)); p->deleteLater(); });
+        p->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "error", "-show_streams", "-show_format", "-of", "json", selectedPath});
+    }
+    void runHttpTest() {
+        if (!server || selectedPath.isEmpty()) { debug(tr("FAIL HTTP: select an input file first")); return; }
+        const auto url = server->mediaUrl(QHostAddress::LocalHost); auto *s = new QTcpSocket(this); debug(tr("RUN HTTP: range request against %1").arg(url.toString()));
+        connect(s, &QTcpSocket::connected, this, [s, url] { s->write("GET /video HTTP/1.1\r\nHost: " + url.host().toUtf8() + "\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n"); });
+        connect(s, &QTcpSocket::readyRead, this, [this, s] { const auto response = s->readAll(); if (response.contains("206 Partial Content") && response.contains("Content-Range: bytes 0-15/")) debug(tr("PASS HTTP: server returned 206 and Content-Range")); else if (response.contains("200 OK")) debug(tr("WARN HTTP: receiver/server ignored range")); else debug(tr("FAIL HTTP: unexpected response")); s->disconnectFromHost(); });
+        connect(s, &QAbstractSocket::errorOccurred, this, [this, s] { debug(tr("FAIL HTTP: %1").arg(s->errorString())); s->deleteLater(); });
+        connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater); s->connectToHost(QHostAddress::LocalHost, server->serverPort());
+    }
+    void runDeviceTest() {
+        const int row = deviceList->currentRow(); if (row < 0 || row >= found.size()) { debug(tr("FAIL device: select a discovered device")); return; }
+        const auto &d = found[row]; debug(tr("INFO device: %1 (%2) at %3").arg(d.name, d.kind == DeviceKind::AppleTV ? "AirPlay" : "Chromecast", d.address.toString()));
+        const quint16 port = d.kind == DeviceKind::AppleTV ? 7000 : 8009;
+        QElapsedTimer timer; timer.start(); QTcpSocket baseline; baseline.connectToHost(d.address, port);
+        if (baseline.waitForConnected(3000)) { debug(tr("PASS network: TCP %1 connected in %2 ms").arg(port).arg(timer.elapsed())); baseline.disconnectFromHost(); }
+        else debug(tr("FAIL network: TCP %1 connection failed after %2 ms: %3").arg(port).arg(timer.elapsed()).arg(baseline.errorString()));
+        const auto executable = d.kind == DeviceKind::AppleTV ? qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry")) : qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
+        const auto command = d.kind == DeviceKind::AppleTV ? QStringList{"probe", d.address.toString(), "7000"} : QStringList{"probe", d.address.toString()};
+        auto *p = new QProcess(this); connect(p, &QProcess::finished, this, [this, p](int code, QProcess::ExitStatus) { const auto out = QString::fromLocal8Bit(p->readAllStandardOutput()).trimmed(); const auto err = QString::fromLocal8Bit(p->readAllStandardError()).trimmed(); debug((code == 0 ? tr("PASS device: ") : tr("FAIL device: ")) + (out.isEmpty() ? err : out)); p->deleteLater(); });
+        p->start(executable, command); if (!p->waitForStarted(1000)) { debug(tr("FAIL device: backend unavailable: %1").arg(executable)); p->deleteLater(); }
+    }
     void selectFile(const QString &path) {
+        videoCodec.clear(); videoPixelFormat.clear(); videoProfile.clear(); audioCodec.clear(); subtitleCodec.clear(); subtitleCodecs.clear();
+        chromecastFallbackAttempted = false;
+        airplayFallbackAttempted = false;
         fileLabel->setText(QFileInfo(path).fileName());
         fileLabel->setToolTip(path);
         selectedPath = path;
         durationSeconds = 0;
         elapsedSeconds = 0;
-        progress->setValue(0); progress->setEnabled(false);
+        progress->setValue(0); progress->setEnabled(true);
         inspectTracks(path);
         if (!server) server = new MediaServer(this);
         if (!server->isListening() && !server->serve(path)) {
@@ -228,8 +335,9 @@ private:
                     const auto label = QString("%1 %2%3").arg(type == "audio" ? tr("Audio") : tr("Subtitles"))
                         .arg(language.isEmpty() ? tr("track %1").arg(type == "audio" ? audioNumber : subtitleNumber) : language)
                         .arg(title.isEmpty() ? QString() : " – " + title);
-                    if (type == "audio") { audioTrack->addItem(label, index); ++audioNumber; }
-                    if (type == "subtitle") { subtitleTrack->addItem(label, index); ++subtitleNumber; }
+                    if (type == "audio") { audioTrack->addItem(label, index); ++audioNumber; if (index == 1 || audioTrack->count() == 1) audioCodec = stream.value("codec_name").toString(); }
+                    if (type == "video" && videoCodec.isEmpty()) { videoCodec = stream.value("codec_name").toString(); videoPixelFormat = stream.value("pix_fmt").toString(); videoProfile = stream.value("profile").toString(); }
+                    if (type == "subtitle") { subtitleTrack->addItem(label, index); ++subtitleNumber; subtitleCodecs.insert(index, stream.value("codec_name").toString()); }
                 }
             }
             probe->deleteLater();
@@ -240,11 +348,14 @@ private:
             if (code == 0) {
                 const auto object = QJsonDocument::fromJson(durationProbe->readAllStandardOutput()).object();
                 durationSeconds = object.value("format").toObject().value("duration").toDouble();
-                progress->setEnabled(durationSeconds > 0);
+                if (durationSeconds <= 0) for (const auto &value : object.value("streams").toArray()) durationSeconds = qMax(durationSeconds, value.toObject().value("duration").toDouble());
+                // Keep the control interactive even when a container omits
+                // duration; release-time validation provides the explanation.
+                progress->setEnabled(true);
             }
             durationProbe->deleteLater();
         });
-        durationProbe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "quiet", "-print_format", "json", "-show_format", path});
+        durationProbe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "quiet", "-print_format", "json", "-show_entries", "format=duration:stream=duration", path});
     }
     void discover() {
         found.clear(); deviceList->clear(); deviceList->addItem(tr("Searching…"));
@@ -349,6 +460,27 @@ private:
     void beam() {
         const int row = deviceList->currentRow();
         if (!server || row < 0 || row >= found.size()) return;
+        // Prepare a selected subtitle/audio stream once, before handing the
+        // resulting URL/path to any backend. Direct AirPlay can then let the
+        // receiver render mov_text while retaining the original video codec.
+        const int selectedSubtitle = subtitleTrack->currentData().toInt();
+        const int selectedAudio = audioTrack->currentData().isValid() ? audioTrack->currentData().toInt() : -1;
+        subtitleCodec = subtitleCodecs.value(selectedSubtitle);
+        const auto requestedEncoder = selectedVideoEncoder(false);
+        if (found[row].kind == DeviceKind::AppleTV && appleTvBackend &&
+            appleTvBackend->currentData().toString() == "direct" &&
+            (selectedSubtitle >= 0 || selectedAudio >= 0)) {
+            const auto output = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation)).filePath("beamer-selected.mp4");
+            if (ffmpeg) ffmpeg->kill();
+            ffmpeg = new QProcess(this);
+            connect(ffmpeg, &QProcess::readyReadStandardError, this, [this] { statusBar()->showMessage(tr("Preparing selected media… %1").arg(QString::fromLocal8Bit(ffmpeg->readAllStandardError()).section(' ', -1).trimmed())); });
+            connect(ffmpeg, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, output](int code, QProcess::ExitStatus) {
+                if (code != 0 || !server->serve(output)) { statusBar()->showMessage(tr("Could not prepare the selected subtitle stream")); return; }
+                ffmpeg->deleteLater(); ffmpeg = nullptr; beamNow();
+            });
+            ffmpeg->start(qEnvironmentVariable("BEAMER_FFMPEG", "ffmpeg"), MediaPreparer::remuxArguments(selectedPath, selectedAudio, selectedSubtitle, output, subtitleCodec, true, true, requestedEncoder, videoPixelFormat.contains("10") || videoPixelFormat.contains("p010")));
+            play->setEnabled(false); statusBar()->showMessage(tr("Preparing selected subtitle…")); return;
+        }
         // AirFry reads and encodes the original file incrementally. The
         // track-remux below is only needed for Chromecast's HTTP playback;
         // doing it first would add a full-file delay on Apple TV.
@@ -356,10 +488,17 @@ private:
             beamNow();
             return;
         }
-        if (audioTrack->count() > 0 && audioTrack->currentData().isValid()) {
+        const bool selectedTracks = audioTrack->count() > 0 && audioTrack->currentData().isValid();
+        const bool chromecastSafe = QFileInfo(selectedPath).suffix().compare("mp4", Qt::CaseInsensitive) == 0 &&
+            videoCodec == "h264" && (videoPixelFormat.isEmpty() || videoPixelFormat == "yuv420p") &&
+            (audioCodec.isEmpty() || audioCodec == "aac" || audioCodec == "mp3");
+        if (selectedTracks || !chromecastSafe) {
             const auto output = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation)).filePath("beamer-selected.mp4");
-            QStringList args{"-y", "-i", selectedPath, "-map", "0:v:0", "-map", QString("0:%1").arg(audioTrack->currentData().toInt()), "-c:v", "copy", "-c:a", "aac"};
-            if (subtitleTrack->currentData().toInt() >= 0) args << "-map" << QString("0:%1").arg(subtitleTrack->currentData().toInt()) << "-c:s" << "mov_text";
+            const auto args = MediaPreparer::remuxArguments(selectedPath,
+                selectedTracks ? audioTrack->currentData().toInt() : -1,
+                selectedSubtitle, output, subtitleCodec, chromecastSafe, false,
+                chromecastFallbackAttempted ? QStringLiteral("libx264") : selectedVideoEncoder(true),
+                videoPixelFormat.contains("10") || videoPixelFormat.contains("p010"));
             if (ffmpeg) ffmpeg->kill();
             ffmpeg = new QProcess(this);
             connect(ffmpeg, &QProcess::readyReadStandardError, this, [this] { statusBar()->showMessage(tr("Preparing selected tracks… %1").arg(QString::fromLocal8Bit(ffmpeg->readAllStandardError()).section(' ', -1).trimmed())); });
@@ -367,7 +506,7 @@ private:
                 if (code != 0 || !server->serve(output)) { statusBar()->showMessage(tr("Could not prepare selected tracks")); return; }
                 ffmpeg->deleteLater(); ffmpeg = nullptr; beamNow();
             });
-            args << output; ffmpeg->start(qEnvironmentVariable("BEAMER_FFMPEG", "ffmpeg"), args);
+            ffmpeg->start(qEnvironmentVariable("BEAMER_FFMPEG", "ffmpeg"), args);
             play->setEnabled(false); statusBar()->showMessage(tr("Preparing selected tracks…")); return;
         }
         beamNow();
@@ -377,6 +516,26 @@ private:
         if (row < 0 || row >= found.size()) return;
         const auto &device = found.at(row);
         if (device.kind != DeviceKind::Chromecast) {
+            if (appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
+                const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
+                if (!QFileInfo::exists(airfry)) { statusBar()->showMessage(tr("Native Apple TV backend is not installed")); return; }
+                if (!process) process = new QProcess(this);
+                connect(process, &QProcess::readyReadStandardOutput, this, [this] {
+                    const auto response = QJsonDocument::fromJson(process->readAllStandardOutput()).object();
+                    if (!response.value("ok").toBool()) debug(tr("FAIL direct media: %1").arg(response.value("error").toString()));
+                }, Qt::UniqueConnection);
+                connect(process, &QProcess::readyReadStandardError, this, [this] { const auto s = QString::fromLocal8Bit(process->readAllStandardError()).trimmed(); if (!s.isEmpty()) debug(s); }, Qt::UniqueConnection);
+                connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+                    if (code != 0 && !airplayFallbackAttempted) {
+                        airplayFallbackAttempted = true;
+                        debug(tr("INFO Direct media failed; falling back to native mirror"));
+                        process->deleteLater(); process = nullptr;
+                        QTimer::singleShot(0, this, [this] { beamNow(); });
+                    }
+                }, Qt::UniqueConnection);
+                if (process->state() != QProcess::Running) { process->start(airfry, {"media", device.address.toString(), "--url", server->mediaUrl(device.address).toString()}); if (!process->waitForStarted(1500)) { statusBar()->showMessage(tr("Direct backend unavailable; use Mirror")); return; } }
+                paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Direct media playback on %1").arg(device.name)); return;
+            }
             const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
             if (QFileInfo::exists(airfry)) {
                 if (!process) process = new QProcess(this);
@@ -385,12 +544,14 @@ private:
                     if (!text.isEmpty()) statusBar()->showMessage(text.split('\n').last());
                 }, Qt::UniqueConnection);
                 connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+                    if (code != 0 && !airplayFallbackAttempted) { airplayFallbackAttempted = true; debug(tr("INFO AirPlay session failed; retrying with conservative video-only settings")); process->deleteLater(); process = nullptr; QTimer::singleShot(0, this, [this] { beamNow(); }); return; }
                     if (code != 0) statusBar()->showMessage(tr("Apple TV sender exited with code %1").arg(code));
                     process->deleteLater(); process = nullptr;
                 }, Qt::UniqueConnection);
                 // Keep the stable video path isolated while file-audio
                 // negotiation is validated independently.
                 QStringList airplayArgs{"mirror", device.address.toString(), "--file", selectedPath, "--sw", "--debug"};
+                if (airplayFallbackAttempted) airplayArgs << "--bitrate" << "3000" << "--no-audio";
                 if (seekSeconds > 0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
                 // File audio is streamed by AirFry alongside the video. Set
                 // BEAMER_NO_AUDIO=1 only when video-only playback is desired.
@@ -418,12 +579,24 @@ private:
         const auto nativeCast = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
         const auto executable = QFileInfo::exists(nativeCast) ? nativeCast : QStringLiteral("catt");
         const auto args = executable == nativeCast ? QStringList{"cast", device.address.toString(), url} : QStringList{"-d", device.address.toString(), "cast", url};
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+            if (code != 0 && !chromecastFallbackAttempted) { chromecastFallbackAttempted = true; debug(tr("INFO Chromecast direct play failed; preparing compatibility fallback")); beam(); }
+        }, Qt::UniqueConnection);
         process->start(executable, args);
         if (!process->waitForStarted(1000)) statusBar()->showMessage(tr("Chromecast backend unavailable: build beamer-chromecast"));
         else statusBar()->showMessage(tr("Sending video to %1…").arg(device.name));
     }
     void seekTo(double seconds) {
-        if (found.isEmpty() || !process || process->state() != QProcess::Running) return;
+        if (found.isEmpty() || !process) return;
+        if (found[deviceList->currentRow()].kind == DeviceKind::Chromecast) {
+            const auto helper = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
+            auto *seek = new QProcess(this); connect(seek, &QProcess::finished, seek, &QObject::deleteLater);
+            seek->start(helper, {"seek", found[deviceList->currentRow()].address.toString(), QString::number(seconds, 'f', 3)});
+            elapsedSeconds = seconds; return;
+        }
+        if (found[deviceList->currentRow()].kind == DeviceKind::AppleTV && appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
+            process->write("seek " + QByteArray::number(seconds, 'f', 6) + "\n"); elapsedSeconds = seconds; return;
+        }
         process->kill();
         process->waitForFinished(1000);
         seekSeconds = seconds; elapsedSeconds = seconds;
@@ -435,12 +608,20 @@ private:
     QPushButton *browse{}, *play{}, *pause{}, *stop{}, *pair{};
     QSlider *progress{}, *volume{};
     QComboBox *audioTrack{}, *subtitleTrack{};
+    QComboBox *appleTvBackend{};
+    QComboBox *videoEncoder{};
     QList<Device> found;
     QString selectedPath;
     QUdpSocket *socket{};
     MediaServer *server{};
     QProcess *process{};
     QProcess *ffmpeg{};
+    QProcess *volumeProcess{};
+    QString videoCodec, videoPixelFormat, videoProfile, audioCodec, subtitleCodec;
+    QHash<int, QString> subtitleCodecs;
+    QTextEdit *debugLog{};
+    bool chromecastFallbackAttempted{};
+    bool airplayFallbackAttempted{};
     bool paused{};
     QTimer *playbackTimer{};
     double durationSeconds{}, elapsedSeconds{}, seekSeconds{};
