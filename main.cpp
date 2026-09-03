@@ -243,6 +243,13 @@ public:
     }
 
 private:
+    static double jsonNumber(const QJsonValue &value) {
+        if (value.isDouble()) return value.toDouble();
+        bool ok = false;
+        const double result = value.toString().toDouble(&ok);
+        return ok ? result : 0.0;
+    }
+
     void populateEncoders() {
         QProcess probe;
         probe.start(qEnvironmentVariable("BEAMER_FFMPEG", "ffmpeg"), {"-hide_banner", "-encoders"});
@@ -326,7 +333,11 @@ private:
         auto *probe = new QProcess(this);
         connect(probe, &QProcess::finished, this, [this, probe](int code, QProcess::ExitStatus) {
             if (code == 0) {
-                const auto streams = QJsonDocument::fromJson(probe->readAllStandardOutput()).object().value("streams").toArray();
+                const auto document = QJsonDocument::fromJson(probe->readAllStandardOutput());
+                const auto root = document.object();
+                const auto probedFormatDuration = jsonNumber(root.value("format").toObject().value("duration"));
+                if (probedFormatDuration > 0) durationSeconds = probedFormatDuration;
+                const auto streams = root.value("streams").toArray();
                 int audioNumber = 1, subtitleNumber = 1;
                 for (const auto &value : streams) {
                     const auto stream = value.toObject(); const auto type = stream.value("codec_type").toString();
@@ -339,19 +350,25 @@ private:
                     if (type == "video" && videoCodec.isEmpty()) { videoCodec = stream.value("codec_name").toString(); videoPixelFormat = stream.value("pix_fmt").toString(); videoProfile = stream.value("profile").toString(); }
                     if (type == "subtitle") { subtitleTrack->addItem(label, index); ++subtitleNumber; subtitleCodecs.insert(index, stream.value("codec_name").toString()); }
                 }
+            } else {
+                debug(tr("WARN ffprobe stream inspection failed: %1").arg(QString::fromLocal8Bit(probe->readAllStandardError()).trimmed()));
             }
             probe->deleteLater();
         });
-        probe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "quiet", "-print_format", "json", "-show_streams", path});
+        probe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "error", "-print_format", "json", "-show_streams", "-show_format", path});
         auto *durationProbe = new QProcess(this);
         connect(durationProbe, &QProcess::finished, this, [this, durationProbe](int code, QProcess::ExitStatus) {
             if (code == 0) {
                 const auto object = QJsonDocument::fromJson(durationProbe->readAllStandardOutput()).object();
-                durationSeconds = object.value("format").toObject().value("duration").toDouble();
-                if (durationSeconds <= 0) for (const auto &value : object.value("streams").toArray()) durationSeconds = qMax(durationSeconds, value.toObject().value("duration").toDouble());
+                const auto probedFormatDuration = jsonNumber(object.value("format").toObject().value("duration"));
+                if (probedFormatDuration > 0) durationSeconds = probedFormatDuration;
+                for (const auto &value : object.value("streams").toArray())
+                    durationSeconds = qMax(durationSeconds, jsonNumber(value.toObject().value("duration")));
                 // Keep the control interactive even when a container omits
                 // duration; release-time validation provides the explanation.
                 progress->setEnabled(true);
+            } else {
+                debug(tr("WARN ffprobe duration probe failed: %1").arg(QString::fromLocal8Bit(durationProbe->readAllStandardError()).trimmed()));
             }
             durationProbe->deleteLater();
         });
@@ -533,7 +550,9 @@ private:
                         QTimer::singleShot(0, this, [this] { beamNow(); });
                     }
                 }, Qt::UniqueConnection);
-                if (process->state() != QProcess::Running) { process->start(airfry, {"media", device.address.toString(), "--url", server->mediaUrl(device.address).toString()}); if (!process->waitForStarted(1500)) { statusBar()->showMessage(tr("Direct backend unavailable; use Mirror")); return; } }
+                const auto mediaUrl = server->mediaUrl(device.address).toString();
+                debug(tr("INFO Direct Media URL: %1").arg(mediaUrl));
+                if (process->state() != QProcess::Running) { process->start(airfry, {"media", device.address.toString(), "--url", mediaUrl}); if (!process->waitForStarted(1500)) { statusBar()->showMessage(tr("Direct backend unavailable; use Mirror")); return; } }
                 paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Direct media playback on %1").arg(device.name)); return;
             }
             const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
@@ -597,8 +616,15 @@ private:
         if (found[deviceList->currentRow()].kind == DeviceKind::AppleTV && appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
             process->write("seek " + QByteArray::number(seconds, 'f', 6) + "\n"); elapsedSeconds = seconds; return;
         }
+        statusBar()->showMessage(tr("Seeking…"));
+        // Disconnect the old process lifecycle handlers before restarting.
+        // Otherwise its queued finished signal can delete the replacement
+        // process created by beamNow().
+        process->disconnect(this);
         process->kill();
         process->waitForFinished(1000);
+        process->deleteLater();
+        process = nullptr;
         seekSeconds = seconds; elapsedSeconds = seconds;
         beamNow();
         seekSeconds = 0;

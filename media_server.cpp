@@ -18,15 +18,19 @@ bool MediaServer::serve(const QString &filePath, quint16 preferredPort) {
 }
 
 QUrl MediaServer::mediaUrl(const QHostAddress &receiver) const {
+    QUrl fallback;
     for (const auto &iface : QNetworkInterface::allInterfaces()) {
         if (!(iface.flags() & QNetworkInterface::IsUp) || (iface.flags() & QNetworkInterface::IsLoopBack)) continue;
         for (const auto &entry : iface.addressEntries()) {
             const auto address = entry.ip();
-            if (address.protocol() == receiver.protocol() && address.protocol() == QAbstractSocket::IPv4Protocol)
-                return QUrl(QStringLiteral("http://%1:%2/video").arg(address.toString()).arg(serverPort()));
+            if (address.protocol() != receiver.protocol() || address.protocol() != QAbstractSocket::IPv4Protocol) continue;
+            const auto candidate = QUrl(QStringLiteral("http://%1:%2/video").arg(address.toString()).arg(serverPort()));
+            if (!fallback.isValid()) fallback = candidate;
+            const auto mask = entry.netmask().toIPv4Address();
+            if (mask && ((address.toIPv4Address() & mask) == (receiver.toIPv4Address() & mask))) return candidate;
         }
     }
-    return QUrl(QStringLiteral("http://127.0.0.1:%1/video").arg(serverPort()));
+    return fallback.isValid() ? fallback : QUrl(QStringLiteral("http://127.0.0.1:%1/video").arg(serverPort()));
 }
 
 void MediaServer::incomingConnection(qintptr descriptor) {

@@ -1676,6 +1676,7 @@ pub fn run_mirror_with_source(
                                 crate::dlog!("[audio] capture started; streaming audio alongside video");
                                 let first_frame = first_frame.clone();
                                 let stop = stop.clone();
+                                let paused = control_handle.paused.clone();
                                 let boot = boot_origin();
                                 audio_handle = Some(std::thread::spawn(move || {
                                     if let Err(e) = audio::stream_audio(
@@ -1683,6 +1684,7 @@ pub fn run_mirror_with_source(
                                         audio_stream,
                                         &first_frame,
                                         &stop,
+                                        &paused,
                                         boot,
                                     ) {
                                         crate::dlog!("[audio] stream ended: {e}");
@@ -2238,10 +2240,10 @@ fn stream_frames(
             macro_rules! flush_vcl {
             () => {{
                 if paused.load(Ordering::Relaxed) {
-                    if paused_frame.is_none() && (!pending_keyframe || vcl_buf.is_empty()) { vcl_buf.clear(); return Ok(()); }
+                    if paused_frame.is_none() && (!pending_keyframe || vcl_buf.is_empty()) { vcl_buf.clear(); continue; }
                     let frame = paused_frame.get_or_insert_with(|| vcl_buf.clone());
                     let ntp = data.lock().unwrap().ntp_time_now(); data.lock().unwrap().send_frame(frame, true, ntp)?;
-                    vcl_buf.clear(); return Ok(());
+                    vcl_buf.clear(); continue;
                 }
             let res: Result<()> = (|| {
                 if vcl_buf.is_empty() {
@@ -2302,6 +2304,11 @@ fn stream_frames(
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        // A resumed stream must not reuse the frame cached by an earlier
+        // pause; the next pause should freeze the most recently displayed AU.
+        if !paused.load(Ordering::Relaxed) {
+            paused_frame = None;
         }
 
         let n = capture.read(&mut buf)?;

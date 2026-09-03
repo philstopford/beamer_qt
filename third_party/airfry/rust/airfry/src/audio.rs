@@ -875,6 +875,7 @@ pub fn stream_audio(
     audio: Arc<Mutex<AudioStream>>,
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     boot_origin: Instant,
 ) -> Result<()> {
     let spf = {
@@ -1003,6 +1004,7 @@ pub fn stream_audio(
         (AUDIO_SPF as u64 * 1_000_000_000) / AUDIO_SAMPLE_RATE as u64,
     );
     let mut next_audio_deadline = Instant::now();
+    let mut was_paused = false;
 
     // The capture started before video did; drop the stale backlog so audio
     // lines up with video (audio.go DrainStale).
@@ -1016,7 +1018,6 @@ pub fn stream_audio(
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-
         let n = capture.read_frame(&mut frame_buf)?;
         if n == 0 {
             // EOF.
@@ -1025,6 +1026,25 @@ pub fn stream_audio(
 
         let payload = frame_buf[..n].to_vec();
         frame_count += 1;
+
+        // Keep the source timeline moving with the video pipeline while
+        // paused, but do not send stale audio after resume. Video consumes
+        // and drops frames in the same state.
+        if paused.load(Ordering::Relaxed) {
+            was_paused = true;
+            next_rtp = next_rtp.wrapping_add(spf);
+            if capture.file_realtime { std::thread::sleep(frame_period); }
+            continue;
+        }
+
+        if was_paused {
+            // Re-anchor the receiver after a pause. The RTP clock was
+            // advanced while samples were discarded so it remains aligned
+            // with video; this sync packet makes that new position explicit.
+            let a = audio.lock().unwrap();
+            let _ = a.send_sync_packet(ntp_boot_timestamp(boot_origin), true);
+            was_paused = false;
+        }
 
         if !use_fec {
             let mut a = audio.lock().unwrap();

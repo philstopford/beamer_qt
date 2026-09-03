@@ -122,7 +122,7 @@ fn cmd_media(args: &[String]) -> i32 {
     let Some(url) = url else { eprintln!("missing --url"); return 2; };
     let mut report = |phase: &str, ok: bool, detail: &str| { eprintln!("[{}] {phase}: {detail}", if ok { "OK" } else { "FAIL" }); };
     let mut ask = ask_pin;
-    let session = match rtsp::Session::connect_host_with(&host, port, "", &rtsp::ConnectOptions::default(), &mut ask, &mut report) { Ok(s) => s, Err(e) => { eprintln!("media pairing failed: {e:#}"); return 1; } };
+    let session = match rtsp::Session::connect_host_with(&host, port, "", &rtsp::ConnectOptions { skip_fairplay: true, ..Default::default() }, &mut ask, &mut report) { Ok(s) => s, Err(e) => { eprintln!("media pairing failed: {e:#}"); return 1; } };
     match media::run(session, &url, start) { Ok(()) => 0, Err(e) => { eprintln!("media failed: {e:#}"); 1 } }
 }
 
@@ -447,6 +447,7 @@ fn cmd_pair(args: &[String]) -> i32 {
             force_pair: flags.force_pair,
             creds_path: flags.creds_path.clone(),
             keyring: flags.cred_backend == "keyring",
+            skip_fairplay: false,
         },
         &mut ask,
         &mut report,
@@ -515,6 +516,7 @@ fn cmd_mirror(args: &[String]) -> i32 {
             force_pair: flags.force_pair,
             creds_path: flags.creds_path.clone(),
             keyring: flags.cred_backend == "keyring",
+            skip_fairplay: false,
         },
         &mut ask,
         &mut report,

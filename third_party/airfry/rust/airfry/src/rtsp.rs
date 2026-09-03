@@ -456,6 +456,11 @@ pub struct ConnectOptions {
     /// Use the system keyring (Secret Service) credential backend instead of the
     /// JSON file (doubletake `-cred-backend keyring`, main.go:55).
     pub keyring: bool,
+
+    /// Media playback uses the AirPlay control session and does not perform
+    /// mirror FairPlay stream setup. Mirror callers retain the historical
+    /// default (false).
+    pub skip_fairplay: bool,
 }
 
 /// A fully-established AirPlay session: socket is paired (and possibly HAP
@@ -737,7 +742,12 @@ impl Session {
         // the ChaCha20 stream key from the pair-verify shared secret instead of a
         // FairPlay stream key. A failure on a receiver that DOES advertise SAP is
         // still fatal.
-        let fp: FairPlayKeys = match fairplay::fair_play_setup(&mut transport, &pair_keys.shared_secret) {
+        let fp: FairPlayKeys = if opts.skip_fairplay {
+            progress("fp-setup", true, "skipped for media playback");
+            let mut iv = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut iv);
+            FairPlayKeys { stream_key: [0u8; 16], iv, ekey: Vec::new(), aes_key: [0u8; 16], m3: Vec::new() }
+        } else { match fairplay::fair_play_setup(&mut transport, &pair_keys.shared_secret) {
             Ok(fp) => {
                 progress("fp-setup", true, "FairPlay stream key derived");
                 fp
@@ -766,7 +776,7 @@ impl Session {
                     m3: Vec::new(),
                 }
             }
-        };
+        }};
 
         Ok(Session {
             transport,

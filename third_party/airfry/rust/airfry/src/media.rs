@@ -6,9 +6,11 @@ use crate::rtsp::Session;
 
 pub fn run(mut session: Session, url: &str, start: f64) -> Result<()> {
     let sid = session.session_id.clone();
-    let headers = [("X-Apple-Session-ID", sid.as_str())];
-    let body = format!("Content-Location: {url}\nStart-Position: {start:.6}\n");
-    let response = session.transport.request("POST", "/play", "text/parameters", body.as_bytes(), &headers)?;
+    let session_header = ("X-Apple-Session-ID", sid.as_str());
+    let headers = [session_header];
+    let start_header = format!("{start:.6}");
+    let play_headers = [session_header, ("Content-Location", url), ("Start-Position", start_header.as_str())];
+    let response = session.transport.request("POST", "/play", "", &[], &play_headers)?;
     if response.status / 100 != 2 { bail!("media /play rejected: HTTP {}", response.status); }
     eprintln!("media playback started");
     for line in std::io::stdin().lock().lines().flatten() {
@@ -19,7 +21,7 @@ pub fn run(mut session: Session, url: &str, start: f64) -> Result<()> {
             Some("seek") => {
                 let seconds: f64 = p.next().context("missing seek position")?.parse().context("invalid seek position")?;
                 let value = format!("{seconds:.6}");
-                let r = session.transport.request("POST", "/scrub", "text/parameters", value.as_bytes(), &headers)?;
+                let r = session.transport.request("POST", "/scrub", "text/parameters", value.as_bytes(), &[session_header])?;
                 if r.status / 100 != 2 { bail!("media seek rejected: HTTP {}", r.status); }
             }
             Some("stop") => { let _ = session.transport.request("POST", "/stop", "", &[], &headers); break; }
@@ -32,7 +34,7 @@ pub fn run(mut session: Session, url: &str, start: f64) -> Result<()> {
 }
 
 fn rate(session: &mut Session, headers: &[(&str, &str)], value: f64) -> Result<()> {
-    let body = format!("value: {value:.6}\n");
+    let body = format!("value: {value:.6}\r\n");
     let r = session.transport.request("POST", "/rate", "text/parameters", body.as_bytes(), headers)?;
     if r.status / 100 != 2 { bail!("media rate change rejected: HTTP {}", r.status); }
     Ok(())
