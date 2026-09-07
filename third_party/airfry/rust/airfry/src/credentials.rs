@@ -228,6 +228,17 @@ impl CredentialStore {
         }
     }
 
+    /// Remove all saved pairing material for one receiver.
+    pub fn remove(&mut self, device_id: &str) -> Result<()> {
+        match &mut self.backend {
+            Backend::File { path, devices } => {
+                devices.remove(device_id);
+                persist_file(path, devices)
+            }
+            Backend::Keyring => anyhow::bail!("removing keyring credentials is not supported"),
+        }
+    }
+
     /// Save stores the pairing identity for a device, preserving any existing
     /// restore token (port of CredentialStore.Save).
     pub fn save(

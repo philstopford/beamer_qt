@@ -829,8 +829,11 @@ fn cascade_transient_then_pin(
                 false,
                 &format!("transient failed ({e:#}); receiver requires a pairing code"),
             );
-            // Ask the receiver to show its PIN (best effort on this conn).
-            let _ = pairing::pair_pin_start(&mut transport);
+            // The receiver must acknowledge the PIN-display request. Do not
+            // accept a code from the UI when the receiver never entered the
+            // pairing flow.
+            pairing::pair_pin_start(&mut transport)
+                .context("ask receiver to display pairing code")?;
             // Prompt the caller (stdin / tray dialog) for the displayed code.
             let code = match pin_provider() {
                 Some(p) if !p.trim().is_empty() => p.trim().to_string(),
@@ -911,9 +914,11 @@ fn pair_pin_display(
     pin_provider: &mut dyn FnMut() -> Option<String>,
     progress: &mut dyn FnMut(&str, bool, &str),
 ) -> Result<(Transport, ReceiverInfo, PairKeys)> {
-    // Ask the receiver to display its pairing code (best-effort).
-    let _ = pairing::pair_pin_start(&mut transport);
-    progress("pin", true, "asked the receiver to show its pairing code");
+    // Do not continue when the receiver did not acknowledge the PIN request;
+    // otherwise the UI can report a misleading successful pairing.
+    pairing::pair_pin_start(&mut transport)
+        .context("ask receiver to display pairing code")?;
+    progress("pin", true, "receiver acknowledged pairing-code display");
     let code = match pin_provider() {
         Some(p) if !p.trim().is_empty() => p.trim().to_string(),
         _ => bail!("pairing requires the code shown on the receiver, but none was provided"),
@@ -921,9 +926,10 @@ fn pair_pin_display(
     progress("pin", true, "got pairing code; running PIN pair-setup");
     // PIN pair-setup + pair-verify on this same clean connection.
     let keys = do_pairing(&mut transport, &mut info, &code, pairing_id, reuse_seed, progress)?;
-    let _ = cred_store
+    cred_store
         .save(device_id, pairing_id, &keys.ed25519_public, &keys.ed25519_seed)
-        .map(|_| progress("credentials", true, "saved pairing identity"));
+        .context("save pairing identity")?;
+    progress("credentials", true, "saved pairing identity");
     Ok((transport, info, keys))
 }
 

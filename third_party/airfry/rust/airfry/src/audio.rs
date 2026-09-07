@@ -489,10 +489,11 @@ impl AudioCapture {
             command.args(["-ss", &start_seconds.to_string()]);
         }
         let mut child = command
-            // The RTP loop below is the pacing clock. Using FFmpeg's -re as
-            // well would throttle the pipe and then throttle it a second
-            // time after each packet, causing periodic audio starvation.
-            .args(["-i", path, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-f", "s16le", "pipe:1"])
+            // Keep the file source on the same real-time clock as video. The
+            // sender must not start with an audio backlog that has already
+            // advanced past the first video frame; that produces an initial
+            // lead followed by starvation when the RTP loop catches up.
+            .args(["-re", "-i", path, "-map", "0:a:0", "-vn", "-af", "aresample=async=1:first_pts=0", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", "-f", "s16le", "pipe:1"])
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn()
             .context("start ffmpeg audio source")?;
         let mut output = child.stdout.take().context("open ffmpeg audio output")?;
@@ -500,7 +501,10 @@ impl AudioCapture {
         let (tx, rx) = mpsc::channel();
         let eos = Arc::new(Mutex::new(false)); let done = eos.clone();
         std::thread::spawn(move || { let mut buf = [0u8; 65536]; let mut total = 0usize; loop { match output.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => { total += n; if tx.send(buf[..n].to_vec()).is_err() { break; } } } } crate::dlog!("[audio] file source ended after {total} PCM bytes"); *done.lock().unwrap() = true; });
-        Ok(AudioCapture { pipeline: gst::Pipeline::new(), rx, pcm: Vec::new(), eos, channels: 2, child: Some(child), file_realtime: true })
+        // FFmpeg now supplies real-time pacing. Keep the normal startup drain
+        // enabled and let stream_audio send frames as they become available;
+        // applying another wall-clock sleep there would double-throttle audio.
+        Ok(AudioCapture { pipeline: gst::Pipeline::new(), rx, pcm: Vec::new(), eos, channels: 2, child: Some(child), file_realtime: false })
     }
 
     /// Block until one full frame of PCM is available, then ALAC-encode it into
@@ -876,6 +880,7 @@ pub fn stream_audio(
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
+    video_stalled: &Arc<AtomicBool>,
     boot_origin: Instant,
 ) -> Result<()> {
     let spf = {
@@ -1005,6 +1010,7 @@ pub fn stream_audio(
     );
     let mut next_audio_deadline = Instant::now();
     let mut was_paused = false;
+    let mut was_video_stalled = false;
 
     // The capture started before video did; drop the stale backlog so audio
     // lines up with video (audio.go DrainStale).
@@ -1018,6 +1024,26 @@ pub fn stream_audio(
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // Pause the source clock as well as transmission.  Reading frames
+        // before checking this flag drains ffmpeg's queued PCM during a long
+        // pause, which causes rapid playback and audio/video drift on resume.
+        if paused.load(Ordering::Relaxed) {
+            was_paused = true;
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        if video_stalled.load(Ordering::Acquire) {
+            was_video_stalled = true;
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        if was_paused {
+            // Both FFmpeg pipes can retain data while the sender is paused,
+            // but their buffered durations are not identical. Discard queued
+            // PCM before reading the first resumed frame so audio does not
+            // run ahead while video drains its own real-time pipe backlog.
+            capture.drain_stale();
+        }
         let n = capture.read_frame(&mut frame_buf)?;
         if n == 0 {
             // EOF.
@@ -1027,23 +1053,18 @@ pub fn stream_audio(
         let payload = frame_buf[..n].to_vec();
         frame_count += 1;
 
-        // Keep the source timeline moving with the video pipeline while
-        // paused, but do not send stale audio after resume. Video consumes
-        // and drops frames in the same state.
-        if paused.load(Ordering::Relaxed) {
-            was_paused = true;
-            next_rtp = next_rtp.wrapping_add(spf);
-            if capture.file_realtime { std::thread::sleep(frame_period); }
-            continue;
-        }
-
         if was_paused {
-            // Re-anchor the receiver after a pause. The RTP clock was
-            // advanced while samples were discarded so it remains aligned
-            // with video; this sync packet makes that new position explicit.
+            // Re-anchor the receiver after a pause. The receiver may have
+            // retained buffered audio while its playback rate was zero; this
+            // sync packet makes the resumed position explicit.
             let a = audio.lock().unwrap();
             let _ = a.send_sync_packet(ntp_boot_timestamp(boot_origin), true);
             was_paused = false;
+        }
+        if was_video_stalled {
+            let a = audio.lock().unwrap();
+            let _ = a.send_sync_packet(ntp_boot_timestamp(boot_origin), true);
+            was_video_stalled = false;
         }
 
         if !use_fec {

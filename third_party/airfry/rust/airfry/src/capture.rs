@@ -223,7 +223,41 @@ impl CaptureSource {
             command.args(["-ss", &cfg.start_seconds.to_string()]);
         }
         let direct_h264 = codec == "h264" && (pix_fmt.is_empty() || pix_fmt == "yuv420p");
-        let ffmpeg_args: Vec<String> = if direct_h264 { vec!["-re", "-i", file, "-an", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-fps_mode", "passthrough", "-f", "h264", "pipe:1"].into_iter().map(String::from).collect() } else { vec!["-re", "-i", file, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-b:v", &format!("{}k", bitrate), "-maxrate", &format!("{}k", bitrate), "-bufsize", &format!("{}k", bitrate.saturating_mul(2)), "-f", "h264", "pipe:1"].into_iter().map(String::from).collect() };
+        let use_nvenc = !direct_h264 && hwaccel_mode(cfg) == "nvenc";
+        let ffmpeg_args: Vec<String> = if direct_h264 {
+            vec!["-re", "-i", file, "-an", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-fps_mode", "passthrough", "-f", "h264", "pipe:1"]
+                .into_iter().map(String::from).collect()
+        } else {
+            let encoder = if use_nvenc { "h264_nvenc" } else { "libx264" };
+            let mut args: Vec<String> = if use_nvenc {
+                ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-re", "-i", file, "-an", "-c:v", encoder]
+                    .into_iter().map(String::from).collect()
+            } else {
+                ["-re", "-i", file, "-an", "-c:v", encoder]
+                    .into_iter().map(String::from).collect()
+            };
+            if use_nvenc {
+                args.extend(["-preset", "p5", "-tune", "ll"].into_iter().map(String::from));
+            } else {
+                args.extend(["-preset", "ultrafast", "-tune", "zerolatency"].into_iter().map(String::from));
+            }
+            if use_nvenc {
+                // Keep decoded CUDA frames on the GPU and perform the format
+                // conversion with CUDA. A plain -pix_fmt yuv420p inserts a
+                // software filter and fails with CUDA frames on this FFmpeg.
+                args.extend(["-vf", "scale_cuda=format=yuv420p"].into_iter().map(String::from));
+            } else {
+                args.extend(["-pix_fmt", "yuv420p"].into_iter().map(String::from));
+            }
+            args.extend([
+                "-fps_mode", "cfr", "-r", &format!("{source_fps:.3}"),
+                "-b:v", &format!("{}k", bitrate),
+                "-maxrate", &format!("{}k", bitrate),
+                "-bufsize", &format!("{}k", bitrate.saturating_mul(2)),
+                "-f", "h264", "pipe:1",
+            ].into_iter().map(String::from));
+            args
+        };
         let mut child = command
             // Keep the file source real-time, but make encoding predictable:
             // an unbounded CRF/veryfast encode can produce bitrate bursts that
@@ -245,7 +279,7 @@ impl CaptureSource {
             }
             *eos_thread.lock().unwrap() = true;
         });
-        crate::dlog!("[CAPTURE] file mode={} codec={} pix_fmt={} source={}x{}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, codec, pix_fmt, width, height);
+        crate::dlog!("[CAPTURE] file mode={} encoder={} codec={} pix_fmt={} source={}x{}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, if use_nvenc { "h264_nvenc" } else if direct_h264 { "copy" } else { "libx264" }, codec, pix_fmt, width, height);
         Ok(CaptureSource { pipeline: gst::Pipeline::new(), rx, leftover: Vec::new(), _portal: None, eos, live_fit: None, child: Some(child) })
     }
 

@@ -70,6 +70,9 @@ The computer and receiver must be on reachable LANs. mDNS/SSDP and receiver retu
 The Apple TV path enables AirFry debug diagnostics; the status bar shows the latest sender message. Test stable video first. Set `BEAMER_FILE_AUDIO=1` for file audio, or `BEAMER_TEST_AUDIO=1` to use a generated tone.
 
 Useful overrides are `BEAMER_PYTHON` (legacy fallback), `BEAMER_AIRFRY`, `BEAMER_FFMPEG`, `BEAMER_FFPROBE`, `BEAMER_APPLETV_BACKEND`, and `BEAMER_VIDEO_ENCODER`.
+For Direct Media across routed networks, set `BEAMER_MEDIA_HOST` to the host IP
+that the receiver can reach; Beamer otherwise selects an interface by comparing
+the receiver address with each interface's netmask.
 
 ## Repository and third-party source
 

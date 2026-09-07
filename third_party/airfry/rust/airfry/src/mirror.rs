@@ -30,7 +30,7 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -184,6 +184,9 @@ pub struct MirrorControl {
     /// Desired mute state. Seeded from `MirrorOpts.mute_audio` at setup and
     /// updated by `set_muted`.
     muted: Arc<AtomicBool>,
+    /// Desired linear volume, retained when a command arrives before SETUP
+    /// binds the control channel.
+    volume: Arc<Mutex<f64>>,
     /// Set by run once the control channel + audio URI are ready. `None` until
     /// then (or after teardown).
     chan: Arc<Mutex<Option<MuteChannel>>>,
@@ -215,6 +218,7 @@ impl MirrorControl {
             stop,
             paused: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
+            volume: Arc::new(Mutex::new(1.0)),
             chan: Arc::new(Mutex::new(None)),
             fit: Arc::new(Mutex::new(None)),
         }
@@ -255,6 +259,8 @@ impl MirrorControl {
 
     /// Set AirPlay volume from 0.0 (muted) to 1.0 (full scale).
     pub fn set_volume(&self, level: f64) -> Result<()> {
+        let level = level.clamp(0.0, 1.0);
+        *self.volume.lock().unwrap() = level;
         let db = if level <= 0.0 { -144.0 } else { 20.0 * level.clamp(0.000001, 1.0).log10() };
         let body = format!("volume: {db:.6}\r\n");
         let guard = self.chan.lock().unwrap();
@@ -842,6 +848,30 @@ struct DataChannel {
     video_h: i32,
 }
 
+/// AirPlay receivers can briefly stop reading while they present a frame.
+/// `write_all` turns that normal TCP backpressure into a fatal EAGAIN on
+/// sockets carrying a write timeout. Retry partial writes for a bounded
+/// interval, then report a receiver stall rather than corrupting the frame
+/// stream or treating it as a source-frame error.
+fn write_data(stream: &mut TcpStream, bytes: &[u8], timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => bail!("receiver closed video data channel while writing"),
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    bail!("receiver stopped consuming video data (write backpressure timeout)");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => return Err(e).context("write video data"),
+        }
+    }
+    Ok(())
+}
+
 impl DataChannel {
     /// ntpTimeNow — per-session NTP frame timestamp using the session
     /// timestampBias, falling back to videoTimestampBias() when unset
@@ -881,8 +911,8 @@ impl DataChannel {
         self.conn
             .set_write_timeout(Some(Duration::from_secs(1)))
             .ok();
-        self.conn.write_all(&header).context("write codec header")?;
-        self.conn.write_all(payload).context("write codec payload")?;
+        write_data(&mut self.conn, &header, Duration::from_secs(1)).context("write codec header")?;
+        write_data(&mut self.conn, payload, Duration::from_secs(1)).context("write codec payload")?;
         Ok(())
     }
 
@@ -924,10 +954,8 @@ impl DataChannel {
         self.conn
             .set_write_timeout(Some(Duration::from_secs(2)))
             .ok();
-        self.conn.write_all(&header).context("write frame header")?;
-        self.conn
-            .write_all(&frame_payload)
-            .context("write frame payload")?;
+        write_data(&mut self.conn, &header, Duration::from_secs(2)).context("write frame header")?;
+        write_data(&mut self.conn, &frame_payload, Duration::from_secs(2)).context("write frame payload")?;
         Ok(())
     }
 
@@ -1524,6 +1552,25 @@ pub fn run_mirror_with_source(
     // here, after RECORD/SETUP, once the session URI is valid.
     control_handle.bind(control.clone(), audio_uri.clone());
 
+    // A UI can send the volume command while the new session is still
+    // negotiating. Reapply the retained value now that the channel exists.
+    let requested_volume = *control_handle.volume.lock().unwrap();
+    if requested_volume < 0.999_999 {
+        let db = if requested_volume <= 0.0 {
+            -144.0
+        } else {
+            20.0 * requested_volume.clamp(0.000001, 1.0).log10()
+        };
+        let body = format!("volume: {db:.6}\r\n");
+        let _ = control.lock().unwrap().request(
+            "SET_PARAMETER",
+            &audio_uri,
+            "text/parameters",
+            body.as_bytes(),
+            &[],
+        );
+    }
+
     // Apply the current desired mute state (seeded from --mute, or updated by an
     // early set_muted call). When muted, this is the post-setup SET_PARAMETER
     // mirroring SetAudioMuted(true) (volume -144 dB); the two initial sends above
@@ -1597,6 +1644,9 @@ pub fn run_mirror_with_source(
 
     // first-frame gate: data-heartbeat / feedback wait for it (mirror.go).
     let first_frame = Arc::new(AtomicBool::new(false));
+    // Set while a video write is blocked by the receiver/network. Audio uses
+    // the same gate so a video stall cannot turn into permanent A/V drift.
+    let video_stalled = Arc::new(AtomicBool::new(false));
 
     // ---- Background loops ----
     // Data-channel heartbeat (1s) after the first frame.
@@ -1677,6 +1727,7 @@ pub fn run_mirror_with_source(
                                 let first_frame = first_frame.clone();
                                 let stop = stop.clone();
                                 let paused = control_handle.paused.clone();
+                                let video_stalled = video_stalled.clone();
                                 let boot = boot_origin();
                                 audio_handle = Some(std::thread::spawn(move || {
                                     if let Err(e) = audio::stream_audio(
@@ -1685,6 +1736,7 @@ pub fn run_mirror_with_source(
                                         &first_frame,
                                         &stop,
                                         &paused,
+                                        &video_stalled,
                                         boot,
                                     ) {
                                         crate::dlog!("[audio] stream ended: {e}");
@@ -1720,7 +1772,7 @@ pub fn run_mirror_with_source(
     let result = match source {
         Some(mut src) => {
             crate::dlog!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
-            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused)
+            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused, &video_stalled)
         }
         None => {
             let capture_cfg = CaptureConfig {
@@ -1742,7 +1794,7 @@ pub fn run_mirror_with_source(
                 control_handle.bind_fit(lf);
             }
             crate::dlog!("[mirror] streaming… (Ctrl-C to stop)");
-            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused);
+            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused, &video_stalled);
             owned_capture = Some(capture);
             r
         }
@@ -2221,6 +2273,7 @@ fn stream_frames(
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
+    video_stalled: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut parser = H264Parser::new();
@@ -2275,18 +2328,27 @@ fn stream_frames(
                             let mut dc = data.lock().unwrap();
                             dc.send_codec_frame(&avcc, ntp)?;
                         }
-                        first_frame.store(true, Ordering::Relaxed);
                         codec_sent = true;
                         stream_primed = true;
                     }
                 }
 
                 let send_start = Instant::now();
+                video_stalled.store(true, Ordering::Release);
                 let sent_len = {
                     let mut dc = data.lock().unwrap();
-                    dc.send_frame(&vcl_buf, pending_keyframe, ntp)?;
+                    let result = dc.send_frame(&vcl_buf, pending_keyframe, ntp);
+                    video_stalled.store(false, Ordering::Release);
+                    result?;
                     vcl_buf.len()
                 };
+                // Do not release the audio thread at codec-header time. The
+                // first video frame can still block on the AirPlay TCP channel;
+                // starting audio before that send completes lets audio run
+                // ahead during the initial video stall.
+                if frame_count == 0 {
+                    first_frame.store(true, Ordering::Relaxed);
+                }
                 cc.record_send(sent_len + 128, send_start.elapsed());
                 vcl_buf.clear();
                 pending_keyframe = false;
@@ -2304,6 +2366,14 @@ fn stream_frames(
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        // Do not consume the source while paused.  In file mode ffmpeg is
+        // real-time, so consuming and dropping access units here advances the
+        // source timeline and makes resume catch up at the wrong position.
+        // The receiver already retains the last video frame on the wire.
+        if paused.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
         }
         // A resumed stream must not reuse the frame cached by an earlier
         // pause; the next pause should freeze the most recently displayed AU.

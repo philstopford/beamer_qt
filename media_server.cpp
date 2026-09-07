@@ -18,6 +18,9 @@ bool MediaServer::serve(const QString &filePath, quint16 preferredPort) {
 }
 
 QUrl MediaServer::mediaUrl(const QHostAddress &receiver) const {
+    const auto forcedHost = qEnvironmentVariable("BEAMER_MEDIA_HOST").trimmed();
+    if (!forcedHost.isEmpty())
+        return QUrl(QStringLiteral("http://%1:%2/video").arg(forcedHost).arg(serverPort()));
     QUrl fallback;
     for (const auto &iface : QNetworkInterface::allInterfaces()) {
         if (!(iface.flags() & QNetworkInterface::IsUp) || (iface.flags() & QNetworkInterface::IsLoopBack)) continue;

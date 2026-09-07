@@ -118,8 +118,17 @@ public:
         auto *deviceToolbar = new QHBoxLayout;
         pair = new QPushButton(tr("Pair…"), devices);
         pair->setVisible(false);
+        resetPairing = new QPushButton(tr("Reset pairing"), devices);
+        resetPairing->setVisible(false);
         deviceToolbar->addWidget(new QLabel(tr("Target:"), devices));
-        deviceToolbar->addStretch(); deviceToolbar->addWidget(pair);
+        deviceToolbar->addWidget(new QLabel(tr("Protocol:"), devices));
+        transportChoice = new QComboBox(devices);
+        transportChoice->addItem(tr("Automatic"), "auto");
+        transportChoice->addItem(tr("Chromecast"), "chromecast");
+        transportChoice->addItem(tr("AirPlay"), "airplay");
+        transportChoice->setEnabled(false);
+        deviceToolbar->addWidget(transportChoice);
+        deviceToolbar->addStretch(); deviceToolbar->addWidget(resetPairing); deviceToolbar->addWidget(pair);
         deviceLayout->addLayout(deviceToolbar);
         deviceList = new QListWidget(devices);
         deviceList->addItem(tr("Searching for Chromecast and Apple TV devices…"));
@@ -167,7 +176,38 @@ public:
         connect(deviceList, &QListWidget::currentRowChanged, this, [this](int row) {
             const bool ready = row >= 0 && row < found.size() && !selectedPath.isEmpty();
             play->setEnabled(ready); pause->setEnabled(ready); stop->setEnabled(ready); pair->setEnabled(row >= 0 && row < found.size());
+            resetPairing->setVisible(row >= 0 && row < found.size() && found[row].kind == DeviceKind::AppleTV);
+            resetPairing->setEnabled(resetPairing->isVisible());
+            transportChoice->setEnabled(row >= 0 && row < found.size());
+            if (row >= 0 && row < found.size()) {
+                const auto saved = QSettings().value("transport/" + found[row].address.toString(), "auto").toString();
+                const int choice = transportChoice->findData(saved);
+                transportChoice->setCurrentIndex(choice >= 0 ? choice : 0);
+            }
             if (row >= 0 && row < found.size()) checkPairStatus(row);
+        });
+        connect(resetPairing, &QPushButton::clicked, this, [this] {
+            const int row = deviceList->currentRow();
+            if (row < 0 || row >= found.size()) return;
+            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
+            if (!QFileInfo::exists(airfry)) { statusBar()->showMessage(tr("AirPlay backend is not installed")); return; }
+            auto *reset = new QProcess(this);
+            connect(reset, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, reset, row](int code, QProcess::ExitStatus) {
+                const auto error = QString::fromLocal8Bit(reset->readAllStandardError()).trimmed();
+                statusBar()->showMessage(code == 0 ? tr("Pairing information reset; pair again when ready") : tr("Could not reset pairing: %1").arg(error));
+                reset->deleteLater();
+                if (code == 0) checkPairStatus(row);
+            });
+            reset->start(airfry, {"credentials-reset", found[row].address.toString()});
+        });
+        connect(transportChoice, &QComboBox::currentIndexChanged, this, [this](int index) {
+            const int row = deviceList->currentRow();
+            if (row < 0 || row >= found.size() || index < 0) return;
+            const auto choice = transportChoice->itemData(index).toString();
+            QSettings().setValue("transport/" + found[row].address.toString(), choice);
+            const auto kind = choice == "chromecast" ? DeviceKind::Chromecast : DeviceKind::AppleTV;
+            if (choice != "auto") found[row].kind = kind;
+            pair->setVisible(found[row].kind == DeviceKind::AppleTV);
         });
         connect(play, &QPushButton::clicked, this, [this] { beam(); });
         connect(progress, &QSlider::sliderPressed, this, [this] { seeking = true; });
@@ -179,12 +219,23 @@ public:
         });
         playbackTimer = new QTimer(this);
         connect(playbackTimer, &QTimer::timeout, this, [this] {
-            if (!seeking && process && process->state() == QProcess::Running && durationSeconds > 0) {
+            if (!paused && !seeking && process && process->state() == QProcess::Running && durationSeconds > 0) {
                 elapsedSeconds += 0.25;
                 progress->setValue(qBound(0, int(elapsedSeconds / durationSeconds * 1000.0), 1000));
             }
         });
-        connect(stop, &QPushButton::clicked, this, [this] { if (process) process->kill(); });
+        connect(stop, &QPushButton::clicked, this, [this] {
+            pendingBeam = false;
+            if (process && process->state() != QProcess::NotRunning) {
+                stopping = true;
+                process->kill();
+                play->setEnabled(false);
+                pause->setEnabled(false);
+            }
+            paused = false;
+            pause->setText(tr("Pause"));
+            seekSeconds = -1.0;
+        });
         connect(pause, &QPushButton::clicked, this, [this] {
 #ifdef Q_OS_UNIX
             if (process && process->state() == QProcess::Running) {
@@ -207,14 +258,32 @@ public:
             const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
             if (QFileInfo::exists(airfry)) {
                 auto *pairing = new QProcess(this);
-                connect(pairing, &QProcess::readyReadStandardError, this, [this, pairing] { const auto s = QString::fromLocal8Bit(pairing->readAllStandardError()).trimmed(); if (!s.isEmpty()) statusBar()->showMessage(s.split('\n').last()); });
-                pairing->start(airfry, {"pair", found[row].address.toString(), "--debug"});
+                connect(pairing, &QProcess::errorOccurred, this, [this, pairing](QProcess::ProcessError error) {
+                    if (error == QProcess::FailedToStart)
+                        statusBar()->showMessage(tr("Apple TV pairing could not start: %1").arg(pairing->errorString()));
+                });
+                // Always force a fresh pairing from the UI. This is also the
+                // recovery path for receivers whose saved identity became
+                // stale (common after resetting an AirPlay receiver).
+                pairing->start(airfry, {"pair", found[row].address.toString(), "--pair", "--debug"});
                 QTimer::singleShot(1500, this, [this, pairing] {
                     bool accepted = false;
                     const auto pin = QInputDialog::getText(this, tr("Pair Apple TV"), tr("Enter the PIN now shown on your Apple TV:"), QLineEdit::Normal, {}, &accepted);
                     if (accepted) { pairing->write(pin.toUtf8() + '\n'); pairing->closeWriteChannel(); }
                 });
-                connect(pairing, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, pairing](int code, QProcess::ExitStatus) { statusBar()->showMessage(code == 0 ? tr("Apple TV paired for video playback") : tr("Apple TV pairing failed (code %1)").arg(code)); pairing->deleteLater(); });
+                connect(pairing, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, pairing](int code, QProcess::ExitStatus) {
+                    const auto error = QString::fromLocal8Bit(pairing->readAllStandardError()).trimmed();
+                    const auto output = QString::fromLocal8Bit(pairing->readAllStandardOutput()).trimmed();
+                    if (code == 0) {
+                        statusBar()->showMessage(tr("AirPlay pairing handshake completed; playback has not been verified"));
+                    } else {
+                        const auto detail = !error.isEmpty() ? error : output;
+                        statusBar()->showMessage(detail.isEmpty()
+                            ? tr("Apple TV pairing failed (code %1)").arg(code)
+                            : tr("Apple TV pairing failed: %1").arg(detail.split('\n').last()));
+                    }
+                    pairing->deleteLater();
+                });
                 return;
             }
             bool ok = false;
@@ -224,7 +293,7 @@ public:
                 auto *pairing = new QProcess(this);
                 connect(pairing, &QProcess::readyReadStandardError, this, [this, pairing] { statusBar()->showMessage(QString::fromLocal8Bit(pairing->readAllStandardError()).trimmed().split('\n').last()); });
                 connect(pairing, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, pairing](int code, QProcess::ExitStatus) {
-                    statusBar()->showMessage(code == 0 ? tr("Apple TV paired for video playback") : tr("Apple TV pairing failed (code %1)").arg(code)); pairing->deleteLater();
+                    statusBar()->showMessage(code == 0 ? tr("AirPlay pairing handshake completed; playback has not been verified") : tr("AirPlay pairing failed (code %1)").arg(code)); pairing->deleteLater();
                 });
                 pairing->start(airfry, {"pair", found[row].address.toString(), "--pin", pin, "--debug"});
                 return;
@@ -256,7 +325,10 @@ private:
         const QString text = probe.waitForFinished(2500) ? QString::fromLocal8Bit(probe.readAllStandardOutput()) : QString();
         const auto has = [&text](const QString &name) { return text.contains(QRegularExpression(QStringLiteral("\\s") + QRegularExpression::escape(name) + QStringLiteral("\\s"))); };
         videoEncoder->addItem(tr("CPU (automatic codec)"), "cpu");
-        if (has("h264_nvenc") && has("hevc_nvenc")) videoEncoder->addItem(tr("NVIDIA NVENC (automatic codec)"), "nvenc");
+        // Mirror mode always sends H.264, so it only needs h264_nvenc.  Requiring
+        // the HEVC encoder here incorrectly hides NVENC on otherwise capable
+        // NVIDIA installations.
+        if (has("h264_nvenc")) videoEncoder->addItem(tr("NVIDIA NVENC (automatic codec)"), "nvenc");
         QSettings settings;
         const auto wanted = qEnvironmentVariable("BEAMER_VIDEO_ENCODER", settings.value("encoding/videoEncoder", "libx264").toString());
         const int index = videoEncoder->findData(wanted == "nvenc" ? "nvenc" : "cpu");
@@ -387,7 +459,29 @@ private:
                 QHostAddress sender; quint16 port;
                 socket->readDatagram(data.data(), data.size(), &sender, &port);
                 for (const auto &device : parseSsdpResponse(data, sender)) {
-                    bool duplicate = false; for (const auto &d : found) duplicate |= d.id == device.id;
+                    // A television may advertise Chromecast/DIAL and AirPlay
+                    // independently. Treat services from the same address as
+                    // one receiver; Chromecast is the preferred route when
+                    // both advertisements are present, so an AirPlay PIN
+                    // dialog cannot be triggered accidentally for Chromecast.
+                    const auto existing = std::find_if(found.cbegin(), found.cend(), [&device](const auto &d) { return d.address == device.address; });
+                    if (existing != found.cend()) {
+                        const int index = int(std::distance(found.cbegin(), existing));
+                        // Discovery is asynchronous: AirPlay mDNS can arrive
+                        // before SSDP. Upgrade that row when Chromecast is
+                        // subsequently confirmed for the same receiver.
+                        if (device.kind == DeviceKind::Chromecast && found[index].kind == DeviceKind::AppleTV) {
+                            found[index] = device;
+                            if (auto *container = deviceList->itemWidget(deviceList->item(index))) {
+                                const auto labels = container->findChildren<QLabel*>();
+                                const auto buttons = container->findChildren<QPushButton*>();
+                                if (!labels.isEmpty()) labels.first()->setText(device.name);
+                                if (!buttons.isEmpty()) { buttons.first()->setVisible(false); buttons.first()->setEnabled(false); }
+                            }
+                        }
+                        continue;
+                    }
+                    bool duplicate = false;
                     if (!duplicate) {
                         if (found.isEmpty()) deviceList->clear();
                         found.append(device); addDeviceRow(device);
@@ -426,7 +520,12 @@ private:
                 if (auto *container = deviceList->itemWidget(deviceList->item(row))) {
                     const auto labels = container->findChildren<QLabel*>(); const auto buttons = container->findChildren<QPushButton*>();
                     if (!labels.isEmpty()) labels.first()->setText(found[row].name + (paired ? tr("  (Paired)") : tr("  (Needs pairing)")));
-                    if (!buttons.isEmpty()) { buttons.first()->setEnabled(!paired); buttons.first()->setVisible(!paired); }
+                    if (!buttons.isEmpty()) {
+                        buttons.first()->setText(paired ? tr("Re-pair") : tr("Pair"));
+                        buttons.first()->setEnabled(true);
+                        buttons.first()->setVisible(true);
+                    }
+                    resetPairing->setVisible(paired && row == deviceList->currentRow() && found[row].kind == DeviceKind::AppleTV);
                 }
             }
             check->deleteLater();
@@ -442,7 +541,7 @@ private:
                 if (code != 0) { statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(QString::fromLocal8Bit(scan->readAllStandardError()).trimmed())); scan->deleteLater(); return; }
                 for (const auto &value : QJsonDocument::fromJson(scan->readAllStandardOutput()).array()) {
                     const auto object = value.toObject(); Device device; device.id = object.value("id").toString(); device.name = object.value("name").toString(); device.address = QHostAddress(object.value("address").toString()); device.kind = DeviceKind::AppleTV;
-                    bool duplicate = false; for (const auto &d : found) duplicate |= d.id == device.id;
+                    bool duplicate = false; for (const auto &d : found) duplicate |= d.address == device.address;
                     if (!duplicate) { if (found.isEmpty()) deviceList->clear(); found.append(device); addDeviceRow(device); }
                 }
                 scan->deleteLater();
@@ -463,7 +562,7 @@ private:
                 const auto object = value.toObject();
                 Device device; device.id = object.value("id").toString(); device.name = object.value("name").toString();
                 device.address = QHostAddress(object.value("address").toString()); device.kind = DeviceKind::AppleTV;
-                bool duplicate = false; for (const auto &d : found) duplicate |= d.id == device.id;
+                bool duplicate = false; for (const auto &d : found) duplicate |= d.address == device.address;
                 if (!duplicate) {
                     if (found.isEmpty()) deviceList->clear();
                     found.append(device); addDeviceRow(device);
@@ -540,44 +639,91 @@ private:
                 connect(process, &QProcess::readyReadStandardOutput, this, [this] {
                     const auto response = QJsonDocument::fromJson(process->readAllStandardOutput()).object();
                     if (!response.value("ok").toBool()) debug(tr("FAIL direct media: %1").arg(response.value("error").toString()));
-                }, Qt::UniqueConnection);
-                connect(process, &QProcess::readyReadStandardError, this, [this] { const auto s = QString::fromLocal8Bit(process->readAllStandardError()).trimmed(); if (!s.isEmpty()) debug(s); }, Qt::UniqueConnection);
+                });
+                connect(process, &QProcess::readyReadStandardError, this, [this] { const auto s = QString::fromLocal8Bit(process->readAllStandardError()).trimmed(); if (!s.isEmpty()) debug(s); });
                 connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
                     if (code != 0 && !airplayFallbackAttempted) {
                         airplayFallbackAttempted = true;
                         debug(tr("INFO Direct media failed; falling back to native mirror"));
+                        if (appleTvBackend) {
+                            const int mirror = appleTvBackend->findData("mirror");
+                            if (mirror >= 0) appleTvBackend->setCurrentIndex(mirror);
+                        }
                         process->deleteLater(); process = nullptr;
                         QTimer::singleShot(0, this, [this] { beamNow(); });
+                    } else if (code != 0) {
+                        const auto error = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
+                        statusBar()->showMessage(error.isEmpty()
+                            ? tr("Direct Media failed (code %1)").arg(code)
+                            : tr("Direct Media failed: %1").arg(error.split('\n').last()));
                     }
-                }, Qt::UniqueConnection);
+                });
                 const auto mediaUrl = server->mediaUrl(device.address).toString();
                 debug(tr("INFO Direct Media URL: %1").arg(mediaUrl));
                 if (process->state() != QProcess::Running) { process->start(airfry, {"media", device.address.toString(), "--url", mediaUrl}); if (!process->waitForStarted(1500)) { statusBar()->showMessage(tr("Direct backend unavailable; use Mirror")); return; } }
-                paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Direct media playback on %1").arg(device.name)); return;
+                paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Direct Media session requested on %1; waiting for receiver").arg(device.name)); return;
             }
             const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
             if (QFileInfo::exists(airfry)) {
                 if (!process) process = new QProcess(this);
+                if (process->state() != QProcess::NotRunning) {
+                    pendingBeam = true;
+                    stopping = false;
+                    process->kill();
+                    play->setEnabled(false);
+                    pause->setEnabled(false);
+                    statusBar()->showMessage(tr("Stopping the previous AirPlay session…"));
+                    return;
+                }
+                airplayErrorBuffer.clear();
                 connect(process, &QProcess::readyReadStandardError, this, [this] {
                     const auto text = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
-                    if (!text.isEmpty()) statusBar()->showMessage(text.split('\n').last());
-                }, Qt::UniqueConnection);
+                    if (!text.isEmpty()) { airplayErrorBuffer += text + '\n'; debug(text); }
+                });
+                connect(process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+                    if (error == QProcess::FailedToStart)
+                        statusBar()->showMessage(tr("AirPlay backend could not start: %1").arg(process->errorString()));
+                });
                 connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
-                    if (code != 0 && !airplayFallbackAttempted) { airplayFallbackAttempted = true; debug(tr("INFO AirPlay session failed; retrying with conservative video-only settings")); process->deleteLater(); process = nullptr; QTimer::singleShot(0, this, [this] { beamNow(); }); return; }
-                    if (code != 0) statusBar()->showMessage(tr("Apple TV sender exited with code %1").arg(code));
+                    const auto error = (airplayErrorBuffer + QString::fromLocal8Bit(process->readAllStandardError())).trimmed();
+                    const bool restart = pendingBeam && !stopping;
+                    const bool userStopped = stopping;
+                    if (code != 0 && !userStopped) statusBar()->showMessage(error.isEmpty()
+                        ? tr("AirPlay sender exited with code %1").arg(code)
+                        : tr("AirPlay playback failed: %1").arg(error.split('\n').last()));
                     process->deleteLater(); process = nullptr;
-                }, Qt::UniqueConnection);
+                    stopping = false;
+                    paused = false;
+                    pause->setText(tr("Pause"));
+                    pause->setEnabled(false);
+                    if (restart) {
+                        pendingBeam = false;
+                        QTimer::singleShot(0, this, [this] { beamNow(); });
+                    }
+                });
                 // Keep the stable video path isolated while file-audio
                 // negotiation is validated independently.
-                QStringList airplayArgs{"mirror", device.address.toString(), "--file", selectedPath, "--sw", "--debug"};
-                if (airplayFallbackAttempted) airplayArgs << "--bitrate" << "3000" << "--no-audio";
-                if (seekSeconds > 0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
+                QStringList airplayArgs{"mirror", device.address.toString(), "--file", selectedPath, "--debug"};
+                // AirFry's mirror encoder is independent of FFmpeg's media
+                // preparation encoder.  Explicitly select the matching capture
+                // path instead of silently forcing software encoding.
+                if (videoEncoder && videoEncoder->currentData().toString() == "nvenc")
+                    airplayArgs << "--hwaccel" << "nvenc";
+                else
+                    airplayArgs << "--sw";
+                if (seekSeconds >= 0.0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
                 // File audio is streamed by AirFry alongside the video. Set
                 // BEAMER_NO_AUDIO=1 only when video-only playback is desired.
                 if (qEnvironmentVariableIsSet("BEAMER_NO_AUDIO")) airplayArgs << "--no-audio";
                 if (qEnvironmentVariableIsSet("BEAMER_TEST_AUDIO")) airplayArgs << "--test-audio";
                 process->start(airfry, airplayArgs);
-                if (process->waitForStarted(1000)) { paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Sending local video to %1…").arg(device.name)); return; }
+                if (process->waitForStarted(1000)) {
+                    // AirFry retains this value if the mirror control channel
+                    // is still negotiating, then applies it after SETUP.
+                    process->write("volume " + QByteArray::number(volume->value() / 100.0, 'f', 3) + "\n");
+                    paused = false; stopping = false; pause->setText(tr("Pause")); pause->setEnabled(true); playbackTimer->start(250); statusBar()->showMessage(tr("AirPlay session starting on %1…").arg(device.name)); return;
+                }
+                statusBar()->showMessage(tr("AirPlay backend unavailable: %1").arg(process->errorString()));
             }
             const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
             if (!QFileInfo::exists(script)) { statusBar()->showMessage(tr("Apple TV backend is not installed")); return; }
@@ -598,9 +744,22 @@ private:
         const auto nativeCast = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
         const auto executable = QFileInfo::exists(nativeCast) ? nativeCast : QStringLiteral("catt");
         const auto args = executable == nativeCast ? QStringList{"cast", device.address.toString(), url} : QStringList{"-d", device.address.toString(), "cast", url};
+        connect(process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+            if (error == QProcess::FailedToStart)
+                statusBar()->showMessage(tr("Chromecast backend could not start: %1").arg(process->errorString()));
+        });
         connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
-            if (code != 0 && !chromecastFallbackAttempted) { chromecastFallbackAttempted = true; debug(tr("INFO Chromecast direct play failed; preparing compatibility fallback")); beam(); }
-        }, Qt::UniqueConnection);
+            const auto error = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
+            if (code != 0 && !chromecastFallbackAttempted) {
+                chromecastFallbackAttempted = true;
+                debug(tr("INFO Chromecast direct play failed; preparing compatibility fallback"));
+                beam();
+            } else if (code != 0) {
+                statusBar()->showMessage(error.isEmpty()
+                    ? tr("Chromecast playback failed (code %1)").arg(code)
+                    : tr("Chromecast playback failed: %1").arg(error.split('\n').last()));
+            }
+        });
         process->start(executable, args);
         if (!process->waitForStarted(1000)) statusBar()->showMessage(tr("Chromecast backend unavailable: build beamer-chromecast"));
         else statusBar()->showMessage(tr("Sending video to %1…").arg(device.name));
@@ -617,6 +776,10 @@ private:
             process->write("seek " + QByteArray::number(seconds, 'f', 6) + "\n"); elapsedSeconds = seconds; return;
         }
         statusBar()->showMessage(tr("Seeking…"));
+        // A seek is implemented by replacing the mirror process. Clear the
+        // old pause state first so the replacement cannot start frozen.
+        paused = false;
+        pause->setText(tr("Pause"));
         // Disconnect the old process lifecycle handlers before restarting.
         // Otherwise its queued finished signal can delete the replacement
         // process created by beamNow().
@@ -625,17 +788,18 @@ private:
         process->waitForFinished(1000);
         process->deleteLater();
         process = nullptr;
-        seekSeconds = seconds; elapsedSeconds = seconds;
+        seekSeconds = qMax(0.0, seconds); elapsedSeconds = seekSeconds;
         beamNow();
-        seekSeconds = 0;
+        seekSeconds = -1.0;
     }
     QLabel *fileLabel{};
     QListWidget *deviceList{};
-    QPushButton *browse{}, *play{}, *pause{}, *stop{}, *pair{};
+    QPushButton *browse{}, *play{}, *pause{}, *stop{}, *pair{}, *resetPairing{};
     QSlider *progress{}, *volume{};
     QComboBox *audioTrack{}, *subtitleTrack{};
     QComboBox *appleTvBackend{};
     QComboBox *videoEncoder{};
+    QComboBox *transportChoice{};
     QList<Device> found;
     QString selectedPath;
     QUdpSocket *socket{};
@@ -648,9 +812,12 @@ private:
     QTextEdit *debugLog{};
     bool chromecastFallbackAttempted{};
     bool airplayFallbackAttempted{};
+    QString airplayErrorBuffer;
+    bool pendingBeam{};
+    bool stopping{};
     bool paused{};
     QTimer *playbackTimer{};
-    double durationSeconds{}, elapsedSeconds{}, seekSeconds{};
+    double durationSeconds{}, elapsedSeconds{}, seekSeconds{-1.0};
     bool seeking{};
 };
 

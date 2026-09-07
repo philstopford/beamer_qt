@@ -56,6 +56,7 @@ fn main() {
         "discover-json" => cmd_discover_json(),
         "probe" => cmd_probe(&args),
         "credentials-check" => cmd_credentials_check(&args),
+        "credentials-reset" => cmd_credentials_reset(&args),
         "discover" | "scan" => cmd_discover(&args),
         "pair" => cmd_pair(&args),
         "mirror" => cmd_mirror(&args),
@@ -163,6 +164,15 @@ fn cmd_credentials_check(args: &[String]) -> i32 {
     let store = credentials::CredentialStore::open_default();
     println!("{}", if store.lookup(id).is_some() { "paired" } else { "needs_pairing" });
     0
+}
+
+fn cmd_credentials_reset(args: &[String]) -> i32 {
+    let Some(id) = args.get(2) else { eprintln!("usage: airfry credentials-reset <device-id>"); return 2; };
+    let mut store = credentials::CredentialStore::open_default();
+    match store.remove(id) {
+        Ok(()) => { println!("reset"); 0 }
+        Err(e) => { eprintln!("credential reset failed: {e:#}"); 1 }
+    }
 }
 
 /// Parsed flags common to the `mirror` (and partly `pair`) subcommands, in the
