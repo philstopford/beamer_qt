@@ -220,18 +220,32 @@ public:
         playbackTimer = new QTimer(this);
         connect(playbackTimer, &QTimer::timeout, this, [this] {
             if (!paused && !seeking && process && process->state() == QProcess::Running && durationSeconds > 0) {
-                elapsedSeconds += 0.25;
+                if (playbackClock.isValid()) elapsedSeconds = clockBaseSeconds + playbackClock.elapsed() / 1000.0;
                 progress->setValue(qBound(0, int(elapsedSeconds / durationSeconds * 1000.0), 1000));
             }
         });
         connect(stop, &QPushButton::clicked, this, [this] {
             pendingBeam = false;
+            ++playbackGeneration;
             if (process && process->state() != QProcess::NotRunning) {
                 stopping = true;
                 process->kill();
+                process->disconnect(this);
+                process->deleteLater();
+                process = nullptr;
                 play->setEnabled(false);
                 pause->setEnabled(false);
             }
+            if (ffmpeg && ffmpeg->state() != QProcess::NotRunning) {
+                ffmpeg->kill();
+                ffmpeg->deleteLater();
+                ffmpeg = nullptr;
+            }
+            playbackTimer->stop();
+            playbackClock.invalidate();
+            clockBaseSeconds = 0.0;
+            elapsedSeconds = 0.0;
+            progress->setValue(0);
             paused = false;
             pause->setText(tr("Pause"));
             seekSeconds = -1.0;
@@ -240,11 +254,18 @@ public:
 #ifdef Q_OS_UNIX
             if (process && process->state() == QProcess::Running) {
                 if (deviceList->currentRow() >= 0 && deviceList->currentRow() < found.size() && found[deviceList->currentRow()].kind == DeviceKind::AppleTV) {
-                    process->write((paused ? "resume\n" : "pause\n")); paused = !paused; pause->setText(paused ? tr("Resume") : tr("Pause")); statusBar()->showMessage(paused ? tr("Playback paused") : tr("Playback resumed")); return;
+                    const bool nextPaused = !paused;
+                    process->write((nextPaused ? "pause\n" : "resume\n"));
+                    if (nextPaused) { clockBaseSeconds = elapsedSeconds; playbackClock.invalidate(); }
+                    else playbackClock.start();
+                    paused = nextPaused; pause->setText(paused ? tr("Resume") : tr("Pause")); statusBar()->showMessage(paused ? tr("Playback paused") : tr("Playback resumed")); return;
                 }
                 const int sig = paused ? SIGCONT : SIGSTOP;
                 if (::kill(static_cast<pid_t>(process->processId()), sig) == 0) {
-                    paused = !paused; pause->setText(paused ? tr("Resume") : tr("Pause"));
+                    const bool nextPaused = !paused;
+                    if (nextPaused) { clockBaseSeconds = elapsedSeconds; playbackClock.invalidate(); }
+                    else playbackClock.start();
+                    paused = nextPaused; pause->setText(paused ? tr("Resume") : tr("Pause"));
                     statusBar()->showMessage(paused ? tr("Playback paused") : tr("Playback resumed"));
                 }
             }
@@ -628,9 +649,16 @@ private:
         beamNow();
     }
     void beamNow() {
+        const quint64 generation = ++playbackGeneration;
         const int row = deviceList->currentRow();
         if (row < 0 || row >= found.size()) return;
         const auto &device = found.at(row);
+        if (seekSeconds < 0.0) {
+            elapsedSeconds = 0.0;
+            progress->setValue(0);
+        }
+        clockBaseSeconds = seekSeconds >= 0.0 ? seekSeconds : 0.0;
+        playbackClock.start();
         if (device.kind != DeviceKind::Chromecast) {
             if (appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
                 const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
@@ -641,7 +669,8 @@ private:
                     if (!response.value("ok").toBool()) debug(tr("FAIL direct media: %1").arg(response.value("error").toString()));
                 });
                 connect(process, &QProcess::readyReadStandardError, this, [this] { const auto s = QString::fromLocal8Bit(process->readAllStandardError()).trimmed(); if (!s.isEmpty()) debug(s); });
-                connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+                connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, generation](int code, QProcess::ExitStatus) {
+                    if (generation != playbackGeneration) return;
                     if (code != 0 && !airplayFallbackAttempted) {
                         airplayFallbackAttempted = true;
                         debug(tr("INFO Direct media failed; falling back to native mirror"));
@@ -684,7 +713,8 @@ private:
                     if (error == QProcess::FailedToStart)
                         statusBar()->showMessage(tr("AirPlay backend could not start: %1").arg(process->errorString()));
                 });
-                connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+                connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, generation](int code, QProcess::ExitStatus) {
+                    if (generation != playbackGeneration) return;
                     const auto error = (airplayErrorBuffer + QString::fromLocal8Bit(process->readAllStandardError())).trimmed();
                     const bool restart = pendingBeam && !stopping;
                     const bool userStopped = stopping;
@@ -748,17 +778,24 @@ private:
             if (error == QProcess::FailedToStart)
                 statusBar()->showMessage(tr("Chromecast backend could not start: %1").arg(process->errorString()));
         });
-        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, generation](int code, QProcess::ExitStatus) {
+            if (generation != playbackGeneration) return;
             const auto error = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
             if (code != 0 && !chromecastFallbackAttempted) {
                 chromecastFallbackAttempted = true;
                 debug(tr("INFO Chromecast direct play failed; preparing compatibility fallback"));
+                process->disconnect(this);
+                process->kill();
+                process->deleteLater();
+                process = nullptr;
                 beam();
             } else if (code != 0) {
                 statusBar()->showMessage(error.isEmpty()
                     ? tr("Chromecast playback failed (code %1)").arg(code)
                     : tr("Chromecast playback failed: %1").arg(error.split('\n').last()));
             }
+            process->deleteLater();
+            process = nullptr;
         });
         process->start(executable, args);
         if (!process->waitForStarted(1000)) statusBar()->showMessage(tr("Chromecast backend unavailable: build beamer-chromecast"));
@@ -770,12 +807,13 @@ private:
             const auto helper = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
             auto *seek = new QProcess(this); connect(seek, &QProcess::finished, seek, &QObject::deleteLater);
             seek->start(helper, {"seek", found[deviceList->currentRow()].address.toString(), QString::number(seconds, 'f', 3)});
-            elapsedSeconds = seconds; return;
+            elapsedSeconds = seconds; clockBaseSeconds = seconds; playbackClock.start(); return;
         }
         if (found[deviceList->currentRow()].kind == DeviceKind::AppleTV && appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
-            process->write("seek " + QByteArray::number(seconds, 'f', 6) + "\n"); elapsedSeconds = seconds; return;
+            process->write("seek " + QByteArray::number(seconds, 'f', 6) + "\n"); elapsedSeconds = seconds; clockBaseSeconds = seconds; playbackClock.start(); return;
         }
         statusBar()->showMessage(tr("Seeking…"));
+        ++playbackGeneration;
         // A seek is implemented by replacing the mirror process. Clear the
         // old pause state first so the replacement cannot start frozen.
         paused = false;
@@ -788,7 +826,7 @@ private:
         process->waitForFinished(1000);
         process->deleteLater();
         process = nullptr;
-        seekSeconds = qMax(0.0, seconds); elapsedSeconds = seekSeconds;
+        seekSeconds = qMax(0.0, seconds); elapsedSeconds = seekSeconds; clockBaseSeconds = seekSeconds; playbackClock.start();
         beamNow();
         seekSeconds = -1.0;
     }
@@ -818,7 +856,10 @@ private:
     bool paused{};
     QTimer *playbackTimer{};
     double durationSeconds{}, elapsedSeconds{}, seekSeconds{-1.0};
+    QElapsedTimer playbackClock;
+    double clockBaseSeconds{};
     bool seeking{};
+    quint64 playbackGeneration{};
 };
 
 int main(int argc, char **argv) {

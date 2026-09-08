@@ -1646,7 +1646,6 @@ pub fn run_mirror_with_source(
     let first_frame = Arc::new(AtomicBool::new(false));
     // Set while a video write is blocked by the receiver/network. Audio uses
     // the same gate so a video stall cannot turn into permanent A/V drift.
-    let video_stalled = Arc::new(AtomicBool::new(false));
 
     // ---- Background loops ----
     // Data-channel heartbeat (1s) after the first frame.
@@ -1727,7 +1726,6 @@ pub fn run_mirror_with_source(
                                 let first_frame = first_frame.clone();
                                 let stop = stop.clone();
                                 let paused = control_handle.paused.clone();
-                                let video_stalled = video_stalled.clone();
                                 let boot = boot_origin();
                                 audio_handle = Some(std::thread::spawn(move || {
                                     if let Err(e) = audio::stream_audio(
@@ -1736,7 +1734,6 @@ pub fn run_mirror_with_source(
                                         &first_frame,
                                         &stop,
                                         &paused,
-                                        &video_stalled,
                                         boot,
                                     ) {
                                         crate::dlog!("[audio] stream ended: {e}");
@@ -1772,7 +1769,7 @@ pub fn run_mirror_with_source(
     let result = match source {
         Some(mut src) => {
             crate::dlog!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
-            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused, &video_stalled)
+            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused)
         }
         None => {
             let capture_cfg = CaptureConfig {
@@ -1794,7 +1791,7 @@ pub fn run_mirror_with_source(
                 control_handle.bind_fit(lf);
             }
             crate::dlog!("[mirror] streaming… (Ctrl-C to stop)");
-            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused, &video_stalled);
+            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused);
             owned_capture = Some(capture);
             r
         }
@@ -2273,7 +2270,6 @@ fn stream_frames(
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
-    video_stalled: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut parser = H264Parser::new();
@@ -2334,12 +2330,9 @@ fn stream_frames(
                 }
 
                 let send_start = Instant::now();
-                video_stalled.store(true, Ordering::Release);
                 let sent_len = {
                     let mut dc = data.lock().unwrap();
-                    let result = dc.send_frame(&vcl_buf, pending_keyframe, ntp);
-                    video_stalled.store(false, Ordering::Release);
-                    result?;
+                    dc.send_frame(&vcl_buf, pending_keyframe, ntp)?;
                     vcl_buf.len()
                 };
                 // Do not release the audio thread at codec-header time. The
