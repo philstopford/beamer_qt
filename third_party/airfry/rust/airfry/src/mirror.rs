@@ -1769,7 +1769,7 @@ pub fn run_mirror_with_source(
     let result = match source {
         Some(mut src) => {
             crate::dlog!("[mirror] streaming from shared capture source… (Ctrl-C to stop)");
-            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused)
+            stream_frames(src.as_mut(), &data, &first_frame, &stop, &control_handle.paused, true)
         }
         None => {
             let capture_cfg = CaptureConfig {
@@ -1791,7 +1791,11 @@ pub fn run_mirror_with_source(
                 control_handle.bind_fit(lf);
             }
             crate::dlog!("[mirror] streaming… (Ctrl-C to stop)");
-            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused);
+            // A file source is already paced by ffmpeg's -re input. Dropping
+            // access units based on synchronous TCP write time turns brief
+            // receiver backpressure into visible timeline jumps while audio
+            // continues uninterrupted.
+            let r = stream_frames(&mut capture, &data, &first_frame, &stop, &control_handle.paused, opts.file.is_none());
             owned_capture = Some(capture);
             r
         }
@@ -2220,12 +2224,15 @@ fn decrypt_event_channel(mut conn: TcpStream, secret: Vec<u8>, stop: Arc<AtomicB
                     while let Some((cseq, consumed)) = parse_rtsp_request(&req) {
                         crate::dlog!(
                             "[event] >>> {}",
-                            String::from_utf8_lossy(&req[..consumed.min(80)])
-                                .lines()
-                                .next()
-                                .unwrap_or("")
+                            String::from_utf8_lossy(&req[..consumed.min(1024)])
+                                .replace("\r\n", " | ")
                         );
-                        let body = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n");
+                        // Apple TV's event channel is unusually strict: its
+                        // receiver accepts the response only in this minimal
+                        // form. In particular, do not add Content-Length: 0.
+                        // A current Apple TV can otherwise keep an apparently
+                        // healthy session alive while never activating media.
+                        let body = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n");
                         let mut frame = (body.len() as u16).to_le_bytes().to_vec();
                         let aad2 = (body.len() as u16).to_le_bytes();
                         let mut n2 = [0u8; 12];
@@ -2270,6 +2277,7 @@ fn stream_frames(
     first_frame: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
+    drop_frames_on_congestion: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; 256 * 1024];
     let mut parser = H264Parser::new();
@@ -2304,7 +2312,7 @@ fn stream_frames(
                     vcl_buf.clear();
                     return Ok(());
                 }
-                if !pending_keyframe && cc.should_drop(frame_count) {
+                if drop_frames_on_congestion && !pending_keyframe && cc.should_drop(frame_count) {
                     vcl_buf.clear();
                     return Ok(());
                 }

@@ -97,15 +97,6 @@ public:
         trackLayout->addWidget(audioTrack, 1); trackLayout->addWidget(subtitleTrack, 1);
         root->addWidget(tracks);
 
-        auto *backendRow = new QHBoxLayout;
-        backendRow->addWidget(new QLabel(tr("Apple TV backend:"), central));
-        appleTvBackend = new QComboBox(central);
-        appleTvBackend->addItem(tr("Mirror (stable fallback)"), "mirror");
-        appleTvBackend->addItem(tr("Direct media (HEVC/HDR/seek)"), "direct");
-        appleTvBackend->setCurrentIndex(appleTvBackend->findData(qEnvironmentVariable("BEAMER_APPLETV_BACKEND", "mirror")));
-        backendRow->addWidget(appleTvBackend); backendRow->addStretch();
-        root->addLayout(backendRow);
-
         auto *encoderRow = new QHBoxLayout;
         encoderRow->addWidget(new QLabel(tr("Transcode encoder:"), central));
         videoEncoder = new QComboBox(central);
@@ -404,7 +395,6 @@ private:
     void selectFile(const QString &path) {
         videoCodec.clear(); videoPixelFormat.clear(); videoProfile.clear(); audioCodec.clear(); subtitleCodec.clear(); subtitleCodecs.clear();
         chromecastFallbackAttempted = false;
-        airplayFallbackAttempted = false;
         fileLabel->setText(QFileInfo(path).fileName());
         fileLabel->setToolTip(path);
         selectedPath = path;
@@ -597,27 +587,12 @@ private:
     void beam() {
         const int row = deviceList->currentRow();
         if (!server || row < 0 || row >= found.size()) return;
-        // Prepare a selected subtitle/audio stream once, before handing the
-        // resulting URL/path to any backend. Direct AirPlay can then let the
-        // receiver render mov_text while retaining the original video codec.
+        // Prepare a selected subtitle/audio stream once before handing the
+        // resulting URL/path to a backend.
         const int selectedSubtitle = subtitleTrack->currentData().toInt();
         const int selectedAudio = audioTrack->currentData().isValid() ? audioTrack->currentData().toInt() : -1;
         subtitleCodec = subtitleCodecs.value(selectedSubtitle);
         const auto requestedEncoder = selectedVideoEncoder(false);
-        if (found[row].kind == DeviceKind::AppleTV && appleTvBackend &&
-            appleTvBackend->currentData().toString() == "direct" &&
-            (selectedSubtitle >= 0 || selectedAudio >= 0)) {
-            const auto output = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation)).filePath("beamer-selected.mp4");
-            if (ffmpeg) ffmpeg->kill();
-            ffmpeg = new QProcess(this);
-            connect(ffmpeg, &QProcess::readyReadStandardError, this, [this] { statusBar()->showMessage(tr("Preparing selected media… %1").arg(QString::fromLocal8Bit(ffmpeg->readAllStandardError()).section(' ', -1).trimmed())); });
-            connect(ffmpeg, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, output](int code, QProcess::ExitStatus) {
-                if (code != 0 || !server->serve(output)) { statusBar()->showMessage(tr("Could not prepare the selected subtitle stream")); return; }
-                ffmpeg->deleteLater(); ffmpeg = nullptr; beamNow();
-            });
-            ffmpeg->start(qEnvironmentVariable("BEAMER_FFMPEG", "ffmpeg"), MediaPreparer::remuxArguments(selectedPath, selectedAudio, selectedSubtitle, output, subtitleCodec, true, true, requestedEncoder, videoPixelFormat.contains("10") || videoPixelFormat.contains("p010")));
-            play->setEnabled(false); statusBar()->showMessage(tr("Preparing selected subtitle…")); return;
-        }
         // AirFry reads and encodes the original file incrementally. The
         // track-remux below is only needed for Chromecast's HTTP playback;
         // doing it first would add a full-file delay on Apple TV.
@@ -660,38 +635,6 @@ private:
         clockBaseSeconds = seekSeconds >= 0.0 ? seekSeconds : 0.0;
         playbackClock.start();
         if (device.kind != DeviceKind::Chromecast) {
-            if (appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
-                const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
-                if (!QFileInfo::exists(airfry)) { statusBar()->showMessage(tr("Native Apple TV backend is not installed")); return; }
-                if (!process) process = new QProcess(this);
-                connect(process, &QProcess::readyReadStandardOutput, this, [this] {
-                    const auto response = QJsonDocument::fromJson(process->readAllStandardOutput()).object();
-                    if (!response.value("ok").toBool()) debug(tr("FAIL direct media: %1").arg(response.value("error").toString()));
-                });
-                connect(process, &QProcess::readyReadStandardError, this, [this] { const auto s = QString::fromLocal8Bit(process->readAllStandardError()).trimmed(); if (!s.isEmpty()) debug(s); });
-                connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, generation](int code, QProcess::ExitStatus) {
-                    if (generation != playbackGeneration) return;
-                    if (code != 0 && !airplayFallbackAttempted) {
-                        airplayFallbackAttempted = true;
-                        debug(tr("INFO Direct media failed; falling back to native mirror"));
-                        if (appleTvBackend) {
-                            const int mirror = appleTvBackend->findData("mirror");
-                            if (mirror >= 0) appleTvBackend->setCurrentIndex(mirror);
-                        }
-                        process->deleteLater(); process = nullptr;
-                        QTimer::singleShot(0, this, [this] { beamNow(); });
-                    } else if (code != 0) {
-                        const auto error = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
-                        statusBar()->showMessage(error.isEmpty()
-                            ? tr("Direct Media failed (code %1)").arg(code)
-                            : tr("Direct Media failed: %1").arg(error.split('\n').last()));
-                    }
-                });
-                const auto mediaUrl = server->mediaUrl(device.address).toString();
-                debug(tr("INFO Direct Media URL: %1").arg(mediaUrl));
-                if (process->state() != QProcess::Running) { process->start(airfry, {"media", device.address.toString(), "--url", mediaUrl}); if (!process->waitForStarted(1500)) { statusBar()->showMessage(tr("Direct backend unavailable; use Mirror")); return; } }
-                paused = false; pause->setText(tr("Pause")); playbackTimer->start(250); statusBar()->showMessage(tr("Direct Media session requested on %1; waiting for receiver").arg(device.name)); return;
-            }
             const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
             if (QFileInfo::exists(airfry)) {
                 if (!process) process = new QProcess(this);
@@ -809,9 +752,6 @@ private:
             seek->start(helper, {"seek", found[deviceList->currentRow()].address.toString(), QString::number(seconds, 'f', 3)});
             elapsedSeconds = seconds; clockBaseSeconds = seconds; playbackClock.start(); return;
         }
-        if (found[deviceList->currentRow()].kind == DeviceKind::AppleTV && appleTvBackend && appleTvBackend->currentData().toString() == "direct") {
-            process->write("seek " + QByteArray::number(seconds, 'f', 6) + "\n"); elapsedSeconds = seconds; clockBaseSeconds = seconds; playbackClock.start(); return;
-        }
         statusBar()->showMessage(tr("Seeking…"));
         ++playbackGeneration;
         // A seek is implemented by replacing the mirror process. Clear the
@@ -835,7 +775,6 @@ private:
     QPushButton *browse{}, *play{}, *pause{}, *stop{}, *pair{}, *resetPairing{};
     QSlider *progress{}, *volume{};
     QComboBox *audioTrack{}, *subtitleTrack{};
-    QComboBox *appleTvBackend{};
     QComboBox *videoEncoder{};
     QComboBox *transportChoice{};
     QList<Device> found;
@@ -849,7 +788,6 @@ private:
     QHash<int, QString> subtitleCodecs;
     QTextEdit *debugLog{};
     bool chromecastFallbackAttempted{};
-    bool airplayFallbackAttempted{};
     QString airplayErrorBuffer;
     bool pendingBeam{};
     bool stopping{};

@@ -19,7 +19,6 @@ mod icon;
 mod info;
 mod latency;
 mod mirror;
-mod media;
 mod pairing;
 mod playfair;
 mod protocol;
@@ -60,7 +59,6 @@ fn main() {
         "discover" | "scan" => cmd_discover(&args),
         "pair" => cmd_pair(&args),
         "mirror" => cmd_mirror(&args),
-        "media" => cmd_media(&args),
         "version" | "--version" | "-V" => {
             println!("airfry {}", env!("CARGO_PKG_VERSION"));
             0
@@ -85,7 +83,6 @@ fn print_help() {
            airfry pair [host[:port]]      Connect + pair + fp-setup against a receiver\n  \
            airfry probe <host>             Query receiver /info capabilities (no pairing)\n  \
            airfry mirror [host[:port]]    Mirror this screen to the receiver\n  \
-           airfry media <host[:port]> --url <url>  Play a URL using native AirPlay media\n  \
            airfry version                 Print version\n\n\
          When no host is given to `pair`/`mirror`/`discover`, a numbered device\n  \
          picker is shown (read a selection from stdin).\n\n\
@@ -113,18 +110,6 @@ fn print_help() {
            --socket <path>        Unix socket path for the daemon control interface",
         ver = env!("CARGO_PKG_VERSION")
     );
-}
-
-fn cmd_media(args: &[String]) -> i32 {
-    let Some(target) = args.get(2).filter(|v| !v.starts_with('-')) else { eprintln!("usage: airfry media <host[:port]> --url <url> [--start seconds]"); return 2; };
-    let (host, port) = match parse_target(target) { Ok(v) => v, Err(e) => { eprintln!("{e}"); return 2; } };
-    let mut url = None; let mut start = 0.0; let mut i = 3;
-    while i < args.len() { match args[i].as_str() { "--url" => { i += 1; url = args.get(i).cloned(); }, "--start" => { i += 1; start = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(0.0); }, _ => {} } i += 1; }
-    let Some(url) = url else { eprintln!("missing --url"); return 2; };
-    let mut report = |phase: &str, ok: bool, detail: &str| { eprintln!("[{}] {phase}: {detail}", if ok { "OK" } else { "FAIL" }); };
-    let mut ask = ask_pin;
-    let session = match rtsp::Session::connect_host_with(&host, port, "", &rtsp::ConnectOptions { skip_fairplay: true, ..Default::default() }, &mut ask, &mut report) { Ok(s) => s, Err(e) => { eprintln!("media pairing failed: {e:#}"); return 1; } };
-    match media::run(session, &url, start) { Ok(()) => 0, Err(e) => { eprintln!("media failed: {e:#}"); 1 } }
 }
 
 fn cmd_probe(args: &[String]) -> i32 {
