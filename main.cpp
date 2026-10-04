@@ -246,10 +246,39 @@ public:
             if (process && process->state() == QProcess::Running) {
                 if (deviceList->currentRow() >= 0 && deviceList->currentRow() < found.size() && found[deviceList->currentRow()].kind == DeviceKind::AppleTV) {
                     const bool nextPaused = !paused;
-                    process->write((nextPaused ? "pause\n" : "resume\n"));
-                    if (nextPaused) { clockBaseSeconds = elapsedSeconds; playbackClock.invalidate(); }
-                    else playbackClock.start();
-                    paused = nextPaused; pause->setText(paused ? tr("Resume") : tr("Pause")); statusBar()->showMessage(paused ? tr("Playback paused") : tr("Playback resumed")); return;
+                    if (nextPaused) {
+                        process->write("pause\n");
+                        clockBaseSeconds = elapsedSeconds;
+                        playbackClock.invalidate();
+                        paused = true;
+                        pause->setText(tr("Resume"));
+                        statusBar()->showMessage(tr("Playback paused"));
+                        return;
+                    }
+
+                    // The mirror transport has no source PTS and its audio and
+                    // video decoders buffer independently. Resuming the same
+                    // process replays different buffered durations and drifts.
+                    // Rebuild both streams at the exact paused playhead, using
+                    // the same path as a slider seek, so they share one origin.
+                    const double resumeAt = clockBaseSeconds;
+                    ++playbackGeneration;
+                    paused = false;
+                    pause->setText(tr("Pause"));
+                    pause->setEnabled(false);
+                    process->disconnect(this);
+                    process->kill();
+                    process->waitForFinished(1000);
+                    process->deleteLater();
+                    process = nullptr;
+                    seekSeconds = qMax(0.0, resumeAt);
+                    elapsedSeconds = seekSeconds;
+                    clockBaseSeconds = seekSeconds;
+                    playbackClock.start();
+                    statusBar()->showMessage(tr("Resuming from %1…").arg(QString::number(seekSeconds, 'f', 1)));
+                    beamNow();
+                    seekSeconds = -1.0;
+                    return;
                 }
                 const int sig = paused ? SIGCONT : SIGSTOP;
                 if (::kill(static_cast<pid_t>(process->processId()), sig) == 0) {

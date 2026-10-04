@@ -270,7 +270,12 @@ impl CaptureSource {
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
             .context("start ffmpeg file source")?;
         let mut stdout = child.stdout.take().context("open ffmpeg output")?;
-        let (tx, rx) = mpsc::channel();
+        // File playback must apply backpressure while paused. An unbounded
+        // queue keeps draining FFmpeg during pause; resume then sends the
+        // accumulated H.264 access units in a burst while audio continues at
+        // real time. Keep about one second of encoded output at most, matching
+        // the bounded file-audio queue.
+        let (tx, rx) = mpsc::sync_channel(8);
         let eos = Arc::new(Mutex::new(false));
         let eos_thread = eos.clone();
         std::thread::spawn(move || {
