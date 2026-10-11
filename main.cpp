@@ -32,6 +32,8 @@
 #include <QHash>
 #include <QSettings>
 #include <QRegularExpression>
+#include <QNetworkInterface>
+#include <QSet>
 #ifdef Q_OS_UNIX
 #include <signal.h>
 #endif
@@ -125,7 +127,11 @@ public:
         deviceList->addItem(tr("Searching for Chromecast and Apple TV devices…"));
         deviceLayout->addWidget(deviceList);
         auto *refresh = new QPushButton(tr("Refresh devices"), devices);
-        deviceLayout->addWidget(refresh);
+        auto *addByAddress = new QPushButton(tr("Add Apple TV by IP…"), devices);
+        auto *discoveryButtons = new QHBoxLayout;
+        discoveryButtons->addWidget(refresh);
+        discoveryButtons->addWidget(addByAddress);
+        deviceLayout->addLayout(discoveryButtons);
         root->addWidget(devices, 1);
 
         auto *debug = new QGroupBox(tr("Debug diagnostics"), central);
@@ -159,6 +165,31 @@ public:
             if (!path.isEmpty()) selectFile(path);
         });
         connect(refresh, &QPushButton::clicked, this, [this] { discover(); });
+        connect(addByAddress, &QPushButton::clicked, this, [this] {
+            bool accepted = false;
+            const auto text = QInputDialog::getText(this, tr("Add Apple TV"),
+                tr("Apple TV IP address:"), QLineEdit::Normal, {}, &accepted).trimmed();
+            if (!accepted || text.isEmpty()) return;
+            QHostAddress address;
+            if (!address.setAddress(text) || address.protocol() != QAbstractSocket::IPv4Protocol) {
+                statusBar()->showMessage(tr("Enter a valid IPv4 address"));
+                return;
+            }
+            if (std::any_of(found.cbegin(), found.cend(), [&address](const auto &d) { return d.address == address; })) {
+                statusBar()->showMessage(tr("That Apple TV is already listed"));
+                return;
+            }
+            if (found.isEmpty()) deviceList->clear();
+            Device device;
+            device.id = address.toString() + ":7000";
+            device.name = tr("Apple TV (%1)").arg(address.toString());
+            device.address = address;
+            device.kind = DeviceKind::AppleTV;
+            found.append(device);
+            addDeviceRow(device);
+            deviceList->setCurrentRow(found.size() - 1);
+            statusBar()->showMessage(tr("Added Apple TV at %1").arg(address.toString()));
+        });
         connect(volume, &QSlider::valueChanged, this, [this](int value) { setReceiverVolume(value); });
         connect(clearDebug, &QPushButton::clicked, this, [this] { debugLog->clear(); });
         connect(runProbe, &QPushButton::clicked, this, [this] { runProbeTest(); });
@@ -533,7 +564,9 @@ private:
             "MAN: \"ssdp:discover\"\\r\\nMX: 2\\r\\nST: ssdp:all\\r\\n\\r\\n";
         socket->writeDatagram(request, QHostAddress("239.255.255.250"), 1900);
         scanAppleTvs();
-        QTimer::singleShot(6000, this, [this] {
+        // Native mDNS takes up to five seconds; the bounded TCP fallback
+        // needs a few more seconds before reporting that nothing was found.
+        QTimer::singleShot(10000, this, [this] {
             if (found.isEmpty()) { deviceList->clear(); deviceList->addItem(tr("No compatible devices found (check LAN/firewall settings)")); statusBar()->showMessage(tr("No receivers detected")); }
             else statusBar()->showMessage(tr("Found %1 receiver(s)").arg(found.size()));
         });
@@ -573,28 +606,101 @@ private:
         check->start(airfry, {"credentials-check", found[row].address.toString()});
     }
 
+    void scanLocalAirplayHosts() {
+        if (std::any_of(found.cbegin(), found.cend(), [](const auto &d) { return d.kind == DeviceKind::AppleTV; })) return;
+
+        QSet<quint32> hosts;
+        for (const auto &interface : QNetworkInterface::allInterfaces()) {
+            debug(tr("DISCOVERY interface %1 flags=0x%2").arg(interface.name()).arg(quint32(interface.flags()), 0, 16));
+            // IsUp is only the administrative state. Host-only VMware
+            // adapters can report IsUp while their link is unknown/down;
+            // require an operational interface for subnet probing.
+            const auto name = interface.name().toLower();
+            const bool virtualAdapter = name.startsWith("vmnet") || name.startsWith("tun") || name.startsWith("tap") || name.startsWith("virbr") || name.startsWith("docker") || name.startsWith("br-");
+            if (!(interface.flags() & QNetworkInterface::IsUp) || !(interface.flags() & QNetworkInterface::IsRunning) || (interface.flags() & QNetworkInterface::IsLoopBack) || virtualAdapter || (interface.type() != QNetworkInterface::Wifi && interface.type() != QNetworkInterface::Ethernet)) {
+                debug(tr("DISCOVERY skip interface %1 (not up/running or loopback)").arg(interface.name()));
+                continue;
+            }
+            for (const auto &entry : interface.addressEntries()) {
+                debug(tr("DISCOVERY address %1/%2 on %3").arg(entry.ip().toString()).arg(entry.prefixLength()).arg(interface.name()));
+                // Keep the fallback bounded. A broad corporate /16 would
+                // otherwise create tens of thousands of sockets at once.
+                if (entry.ip().protocol() != QAbstractSocket::IPv4Protocol || entry.prefixLength() < 22 || entry.prefixLength() > 30) {
+                    debug(tr("DISCOVERY skip address %1 (IPv4 prefix must be /22-/30)").arg(entry.ip().toString()));
+                    continue;
+                }
+                // Build addresses from dotted text rather than converting
+                // Qt's IPv4 value through an ambiguous byte order.
+                const auto octets = entry.ip().toString().split('.');
+                if (octets.size() != 4) continue;
+                const quint32 ip = (octets[0].toUInt() << 24) | (octets[1].toUInt() << 16) | (octets[2].toUInt() << 8) | octets[3].toUInt();
+                const quint32 mask = entry.prefixLength() == 32 ? 0xffffffffu : (0xffffffffu << (32 - entry.prefixLength()));
+                const quint32 network = ip & mask;
+                const quint32 broadcast = network | ~mask;
+                debug(tr("DISCOVERY scan subnet %1/%2 from %3").arg(QHostAddress(network).toString()).arg(entry.prefixLength()).arg(entry.ip().toString()));
+                for (quint32 candidate = network + 1; candidate < broadcast; ++candidate)
+                    if (candidate != ip) hosts.insert(candidate);
+            }
+        }
+        if (hosts.isEmpty()) {
+            debug(tr("DISCOVERY no eligible local IPv4 addresses to scan"));
+            return;
+        }
+        debug(tr("DISCOVERY probing %1 addresses on TCP 7000").arg(hosts.size()));
+        statusBar()->showMessage(tr("mDNS found no Apple TV; checking %1 local addresses…").arg(hosts.size()));
+        for (const quint32 value : hosts) {
+            auto *probe = new QTcpSocket(this);
+            const auto addressText = QStringLiteral("%1.%2.%3.%4")
+                .arg((value >> 24) & 0xff).arg((value >> 16) & 0xff)
+                .arg((value >> 8) & 0xff).arg(value & 0xff);
+            const QHostAddress address(addressText);
+            connect(probe, &QTcpSocket::connected, this, [this, probe, address] {
+                probe->write("GET /info HTTP/1.1\r\nHost: apple-tv.local\r\nConnection: close\r\n\r\n");
+                if (std::any_of(found.cbegin(), found.cend(), [&address](const auto &d) { return d.address == address; })) return;
+                if (found.isEmpty()) deviceList->clear();
+                Device device;
+                device.id = address.toString() + ":7000";
+                device.name = tr("Apple TV (%1)").arg(address.toString());
+                device.address = address;
+                device.kind = DeviceKind::AppleTV;
+                found.append(device);
+                addDeviceRow(device);
+                statusBar()->showMessage(tr("Found Apple TV at %1").arg(address.toString()));
+                probe->disconnectFromHost();
+            });
+            connect(probe, &QTcpSocket::errorOccurred, probe, &QObject::deleteLater);
+            connect(probe, &QTcpSocket::disconnected, probe, &QObject::deleteLater);
+            QTimer::singleShot(3000, probe, [probe] {
+                if (probe->state() != QAbstractSocket::UnconnectedState) probe->abort();
+                else probe->deleteLater();
+            });
+            probe->connectToHost(address, 7000);
+        }
+    }
+
     void scanAppleTvs() {
         const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
         if (QFileInfo::exists(airfry)) {
             auto *scan = new QProcess(this);
             connect(scan, &QProcess::finished, this, [this, scan](int code, QProcess::ExitStatus) {
-                if (code != 0) { statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(QString::fromLocal8Bit(scan->readAllStandardError()).trimmed())); scan->deleteLater(); return; }
+                if (code != 0) { statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(QString::fromLocal8Bit(scan->readAllStandardError()).trimmed())); scan->deleteLater(); scanLocalAirplayHosts(); return; }
                 for (const auto &value : QJsonDocument::fromJson(scan->readAllStandardOutput()).array()) {
                     const auto object = value.toObject(); Device device; device.id = object.value("id").toString(); device.name = object.value("name").toString(); device.address = QHostAddress(object.value("address").toString()); device.kind = DeviceKind::AppleTV;
                     bool duplicate = false; for (const auto &d : found) duplicate |= d.address == device.address;
                     if (!duplicate) { if (found.isEmpty()) deviceList->clear(); found.append(device); addDeviceRow(device); }
                 }
                 scan->deleteLater();
+                scanLocalAirplayHosts();
             });
             scan->start(airfry, {"discover-json"}); return;
         }
         const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
-        if (!QFileInfo::exists(script)) return;
+        if (!QFileInfo::exists(script)) { scanLocalAirplayHosts(); return; }
         auto *scan = new QProcess(this);
         connect(scan, &QProcess::finished, this, [this, scan](int code, QProcess::ExitStatus) {
             if (code != 0) {
                 statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(QString::fromLocal8Bit(scan->readAllStandardError()).trimmed()));
-                scan->deleteLater(); return;
+                scan->deleteLater(); scanLocalAirplayHosts(); return;
             }
             const auto result = QJsonDocument::fromJson(scan->readAllStandardOutput()).object();
             if (result.contains("error")) statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(result.value("error").toString()));
@@ -609,6 +715,7 @@ private:
                 }
             }
             scan->deleteLater();
+            scanLocalAirplayHosts();
         });
         const auto python = qEnvironmentVariable("BEAMER_PYTHON", "python3");
         scan->start(python, {script}); scan->write("{\"command\":\"scan\"}\n"); scan->closeWriteChannel();
