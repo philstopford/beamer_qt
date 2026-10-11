@@ -618,23 +618,24 @@ private:
             const auto name = interface.name().toLower();
             const bool virtualAdapter = name.startsWith("vmnet") || name.startsWith("tun") || name.startsWith("tap") || name.startsWith("virbr") || name.startsWith("docker") || name.startsWith("br-");
             if (!(interface.flags() & QNetworkInterface::IsUp) || !(interface.flags() & QNetworkInterface::IsRunning) || (interface.flags() & QNetworkInterface::IsLoopBack) || virtualAdapter || (interface.type() != QNetworkInterface::Wifi && interface.type() != QNetworkInterface::Ethernet)) {
-                debug(tr("DISCOVERY skip interface %1 (not up/running or loopback)").arg(interface.name()));
+                debug(tr("DISCOVERY skip interface %1 (inactive, virtual, loopback, or unsupported type)").arg(interface.name()));
                 continue;
             }
             for (const auto &entry : interface.addressEntries()) {
                 debug(tr("DISCOVERY address %1/%2 on %3").arg(entry.ip().toString()).arg(entry.prefixLength()).arg(interface.name()));
-                // Keep the fallback bounded. A broad corporate /16 would
+                // Keep the fallback bounded. A broad corporate network would
                 // otherwise create tens of thousands of sockets at once.
                 if (entry.ip().protocol() != QAbstractSocket::IPv4Protocol || entry.prefixLength() < 22 || entry.prefixLength() > 30) {
                     debug(tr("DISCOVERY skip address %1 (IPv4 prefix must be /22-/30)").arg(entry.ip().toString()));
                     continue;
                 }
-                // Build addresses from dotted text rather than converting
-                // Qt's IPv4 value through an ambiguous byte order.
+                // Build the scan range from the dotted address and netmask.
+                // This avoids relying on the byte-order convention of the
+                // QHostAddress quint32 conversion APIs.
                 const auto octets = entry.ip().toString().split('.');
                 if (octets.size() != 4) continue;
                 const quint32 ip = (octets[0].toUInt() << 24) | (octets[1].toUInt() << 16) | (octets[2].toUInt() << 8) | octets[3].toUInt();
-                const quint32 mask = entry.prefixLength() == 32 ? 0xffffffffu : (0xffffffffu << (32 - entry.prefixLength()));
+                const quint32 mask = 0xffffffffu << (32 - entry.prefixLength());
                 const quint32 network = ip & mask;
                 const quint32 broadcast = network | ~mask;
                 debug(tr("DISCOVERY scan subnet %1/%2 from %3").arg(QHostAddress(network).toString()).arg(entry.prefixLength()).arg(entry.ip().toString()));
