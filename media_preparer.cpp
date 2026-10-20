@@ -18,6 +18,7 @@ QStringList MediaPreparer::remuxArguments(const QString &input, int audioIndex,
         if (tenBit && videoEncoder.contains("hevc", Qt::CaseInsensitive)) args << "-pix_fmt" << "p010le";
         else args << "-pix_fmt" << "yuv420p";
         if (videoEncoder.endsWith("_nvenc")) args << "-preset" << "p5";
+        else if (videoEncoder.endsWith("_videotoolbox")) { /* VideoToolbox uses hardware default rate control */ }
         else if (videoEncoder == "libx264" || videoEncoder == "libx265") args << "-preset" << "veryfast";
     } else {
         args << "-c:v" << (copyVideo ? "copy" : videoEncoder);

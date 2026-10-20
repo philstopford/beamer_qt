@@ -211,16 +211,32 @@ public:
         connect(resetPairing, &QPushButton::clicked, this, [this] {
             const int row = deviceList->currentRow();
             if (row < 0 || row >= found.size()) return;
-            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
-            if (!QFileInfo::exists(airfry)) { statusBar()->showMessage(tr("AirPlay backend is not installed")); return; }
-            auto *reset = new QProcess(this);
-            connect(reset, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, reset, row](int code, QProcess::ExitStatus) {
-                const auto error = QString::fromLocal8Bit(reset->readAllStandardError()).trimmed();
-                statusBar()->showMessage(code == 0 ? tr("Pairing information reset; pair again when ready") : tr("Could not reset pairing: %1").arg(error));
-                reset->deleteLater();
-                if (code == 0) checkPairStatus(row);
-            });
-            reset->start(airfry, {"credentials-reset", found[row].address.toString()});
+            const auto airfry = resolveBackendPath("backends/airfry", "BEAMER_AIRFRY");
+            if (QFileInfo::exists(airfry)) {
+                auto *reset = new QProcess(this);
+                connect(reset, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, reset, row](int code, QProcess::ExitStatus) {
+                    const auto error = QString::fromLocal8Bit(reset->readAllStandardError()).trimmed();
+                    statusBar()->showMessage(code == 0 ? tr("Pairing information reset; pair again when ready") : tr("Could not reset pairing: %1").arg(error));
+                    reset->deleteLater();
+                    if (code == 0) checkPairStatus(row);
+                });
+                reset->start(airfry, {"credentials-reset", found[row].address.toString()});
+                return;
+            }
+            const auto script = resolveBackendPath("backends/pyatv_bridge.py");
+            if (QFileInfo::exists(script)) {
+                auto *reset = new QProcess(this);
+                connect(reset, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, reset, row](int, QProcess::ExitStatus) {
+                    statusBar()->showMessage(tr("Pairing information reset; pair again when ready"));
+                    reset->deleteLater();
+                    checkPairStatus(row);
+                });
+                reset->start(qEnvironmentVariable("BEAMER_PYTHON", "python3"), {script});
+                reset->write(QJsonDocument(QJsonObject{{"command", "credentials-reset"}, {"address", found[row].address.toString()}}).toJson(QJsonDocument::Compact) + '\n');
+                reset->closeWriteChannel();
+                return;
+            }
+            statusBar()->showMessage(tr("AirPlay backend is not installed"));
         });
         connect(transportChoice, &QComboBox::currentIndexChanged, this, [this](int index) {
             const int row = deviceList->currentRow();
@@ -327,63 +343,121 @@ public:
         connect(pair, &QPushButton::clicked, this, [this] {
             const int row = deviceList->currentRow();
             if (row < 0 || row >= found.size() || found[row].kind != DeviceKind::AppleTV) { statusBar()->showMessage(tr("This device does not require application pairing")); return; }
-            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
+            const auto airfry = resolveBackendPath("backends/airfry", "BEAMER_AIRFRY");
             if (QFileInfo::exists(airfry)) {
                 auto *pairing = new QProcess(this);
+                auto promptShown = std::make_shared<bool>(false);
+                statusBar()->showMessage(tr("Requesting pairing PIN challenge from Apple TV…"));
                 connect(pairing, &QProcess::errorOccurred, this, [this, pairing](QProcess::ProcessError error) {
                     if (error == QProcess::FailedToStart)
                         statusBar()->showMessage(tr("Apple TV pairing could not start: %1").arg(pairing->errorString()));
                 });
+                auto promptForPin = [this, pairing, promptShown] {
+                    if (*promptShown || pairing->state() == QProcess::NotRunning) return;
+                    *promptShown = true;
+                    bool accepted = false;
+                    const auto pin = QInputDialog::getText(this, tr("Pair Apple TV"), tr("Enter the PIN now shown on your Apple TV:"), QLineEdit::Normal, {}, &accepted);
+                    if (accepted && !pin.trimmed().isEmpty()) {
+                        statusBar()->showMessage(tr("Completing AirPlay pairing handshake…"));
+                        pairing->write(pin.trimmed().toUtf8() + '\n');
+                        pairing->closeWriteChannel();
+                    } else {
+                        pairing->kill();
+                        statusBar()->showMessage(tr("Pairing cancelled"));
+                    }
+                };
+                connect(pairing, &QProcess::readyReadStandardOutput, this, [this, pairing, promptForPin] {
+                    const auto text = QString::fromLocal8Bit(pairing->peek(1024));
+                    if (text.contains("pairing-code display") || text.contains("pin:")) {
+                        promptForPin();
+                    }
+                });
+                connect(pairing, &QProcess::readyReadStandardError, this, [this, pairing, promptForPin] {
+                    const auto text = QString::fromLocal8Bit(pairing->peek(1024));
+                    if (text.contains("Enter the PIN") || text.contains("pin:")) {
+                        promptForPin();
+                    }
+                });
+                // Fallback timer in case stdout/stderr buffering delays detection
+                QTimer::singleShot(2500, pairing, promptForPin);
+
                 // Always force a fresh pairing from the UI. This is also the
                 // recovery path for receivers whose saved identity became
                 // stale (common after resetting an AirPlay receiver).
                 pairing->start(airfry, {"pair", found[row].address.toString(), "--pair", "--debug"});
-                QTimer::singleShot(1500, this, [this, pairing] {
-                    bool accepted = false;
-                    const auto pin = QInputDialog::getText(this, tr("Pair Apple TV"), tr("Enter the PIN now shown on your Apple TV:"), QLineEdit::Normal, {}, &accepted);
-                    if (accepted) { pairing->write(pin.toUtf8() + '\n'); pairing->closeWriteChannel(); }
-                });
-                connect(pairing, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, pairing](int code, QProcess::ExitStatus) {
+
+                connect(pairing, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, pairing, row](int code, QProcess::ExitStatus) {
                     const auto error = QString::fromLocal8Bit(pairing->readAllStandardError()).trimmed();
                     const auto output = QString::fromLocal8Bit(pairing->readAllStandardOutput()).trimmed();
                     if (code == 0) {
-                        statusBar()->showMessage(tr("AirPlay pairing handshake completed; playback has not been verified"));
+                        statusBar()->showMessage(tr("AirPlay pairing handshake completed; Apple TV paired successfully"));
                     } else {
                         const auto detail = !error.isEmpty() ? error : output;
                         statusBar()->showMessage(detail.isEmpty()
                             ? tr("Apple TV pairing failed (code %1)").arg(code)
                             : tr("Apple TV pairing failed: %1").arg(detail.split('\n').last()));
                     }
+                    checkPairStatus(row);
                     pairing->deleteLater();
                 });
                 return;
             }
-            bool ok = false;
-            const auto pin = QInputDialog::getText(this, tr("Pair Apple TV"), tr("Enter the PIN shown on your Apple TV:"), QLineEdit::Normal, {}, &ok);
-            if (!ok || pin.isEmpty()) return;
-            if (QFileInfo::exists(airfry)) {
-                auto *pairing = new QProcess(this);
-                connect(pairing, &QProcess::readyReadStandardError, this, [this, pairing] { statusBar()->showMessage(QString::fromLocal8Bit(pairing->readAllStandardError()).trimmed().split('\n').last()); });
-                connect(pairing, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, pairing](int code, QProcess::ExitStatus) {
-                    statusBar()->showMessage(code == 0 ? tr("AirPlay pairing handshake completed; playback has not been verified") : tr("AirPlay pairing failed (code %1)").arg(code)); pairing->deleteLater();
-                });
-                pairing->start(airfry, {"pair", found[row].address.toString(), "--pin", pin, "--debug"});
+            const auto script = resolveBackendPath("backends/pyatv_bridge.py");
+            if (!QFileInfo::exists(script)) {
+                statusBar()->showMessage(tr("AirPlay backend is not installed"));
                 return;
             }
-            const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
-            auto *pairing = new QProcess(this);
-            connect(pairing, &QProcess::finished, this, [this, pairing](int, QProcess::ExitStatus) {
-                const auto result = QJsonDocument::fromJson(pairing->readAllStandardOutput()).object();
-                statusBar()->showMessage(result.value("ok").toBool() ? tr("Apple TV paired") : tr("Pairing failed: %1").arg(result.value("error").toString())); pairing->deleteLater();
+            statusBar()->showMessage(tr("Requesting pairing PIN challenge from Apple TV…"));
+            auto *startPin = new QProcess(this);
+            connect(startPin, &QProcess::finished, this, [this, startPin, row, script](int, QProcess::ExitStatus) {
+                startPin->deleteLater();
+                bool ok = false;
+                const auto pin = QInputDialog::getText(this, tr("Pair Apple TV"), tr("Enter the PIN shown on your Apple TV:"), QLineEdit::Normal, {}, &ok);
+                if (!ok || pin.isEmpty()) return;
+                auto *pairing = new QProcess(this);
+                connect(pairing, &QProcess::finished, this, [this, pairing, row](int, QProcess::ExitStatus) {
+                    const auto result = QJsonDocument::fromJson(pairing->readAllStandardOutput()).object();
+                    if (result.value("ok").toBool()) {
+                        statusBar()->showMessage(tr("Apple TV paired successfully"));
+                    } else {
+                        statusBar()->showMessage(tr("Pairing failed: %1").arg(result.value("error").toString()));
+                    }
+                    checkPairStatus(row);
+                    pairing->deleteLater();
+                });
+                pairing->start(qEnvironmentVariable("BEAMER_PYTHON", "python3"), {script});
+                pairing->write(QJsonDocument(QJsonObject{{"command", "pair"}, {"id", found[row].id}, {"address", found[row].address.toString()}, {"pin", pin}}).toJson(QJsonDocument::Compact) + '\n');
+                pairing->closeWriteChannel();
             });
-            pairing->start(qEnvironmentVariable("BEAMER_PYTHON", "python3"), {script});
-            pairing->write(QJsonDocument(QJsonObject{{"command", "pair"}, {"id", found[row].id}, {"pin", pin}}).toJson(QJsonDocument::Compact) + '\n');
-            pairing->closeWriteChannel();
+            startPin->start(qEnvironmentVariable("BEAMER_PYTHON", "python3"), {script});
+            startPin->write(QJsonDocument(QJsonObject{{"command", "pair_start"}, {"id", found[row].id}, {"address", found[row].address.toString()}}).toJson(QJsonDocument::Compact) + '\n');
+            startPin->closeWriteChannel();
         });
         discover();
     }
 
 private:
+    static QString resolveBackendPath(const QString &relativeSubpath, const QString &envVar = {}) {
+        if (!envVar.isEmpty()) {
+            const auto env = qEnvironmentVariable(envVar.toUtf8()).trimmed();
+            if (!env.isEmpty()) return env;
+        }
+        const auto appDir = QDir(QCoreApplication::applicationDirPath());
+        const QString direct = appDir.filePath(relativeSubpath);
+        if (QFileInfo::exists(direct)) return direct;
+#ifdef Q_OS_MACOS
+        const QString bundleRes = appDir.filePath("../Resources/" + relativeSubpath);
+        if (QFileInfo::exists(bundleRes)) return bundleRes;
+        const QString bundleParent = appDir.filePath("../../" + relativeSubpath);
+        if (QFileInfo::exists(bundleParent)) return bundleParent;
+        const QString bundleTop = appDir.filePath("../../../" + relativeSubpath);
+        if (QFileInfo::exists(bundleTop)) return bundleTop;
+#endif
+        const QString cwd = QDir::current().filePath(relativeSubpath);
+        if (QFileInfo::exists(cwd)) return cwd;
+        return direct;
+    }
+
     static double jsonNumber(const QJsonValue &value) {
         if (value.isDouble()) return value.toDouble();
         bool ok = false;
@@ -397,13 +471,12 @@ private:
         const QString text = probe.waitForFinished(2500) ? QString::fromLocal8Bit(probe.readAllStandardOutput()) : QString();
         const auto has = [&text](const QString &name) { return text.contains(QRegularExpression(QStringLiteral("\\s") + QRegularExpression::escape(name) + QStringLiteral("\\s"))); };
         videoEncoder->addItem(tr("CPU (automatic codec)"), "cpu");
-        // Mirror mode always sends H.264, so it only needs h264_nvenc.  Requiring
-        // the HEVC encoder here incorrectly hides NVENC on otherwise capable
-        // NVIDIA installations.
+        if (has("h264_videotoolbox")) videoEncoder->addItem(tr("Apple VideoToolbox (hardware accelerated)"), "videotoolbox");
         if (has("h264_nvenc")) videoEncoder->addItem(tr("NVIDIA NVENC (automatic codec)"), "nvenc");
         QSettings settings;
-        const auto wanted = qEnvironmentVariable("BEAMER_VIDEO_ENCODER", settings.value("encoding/videoEncoder", "libx264").toString());
-        const int index = videoEncoder->findData(wanted == "nvenc" ? "nvenc" : "cpu");
+        const auto defaultEncoder = has("h264_videotoolbox") ? QStringLiteral("videotoolbox") : (has("h264_nvenc") ? QStringLiteral("nvenc") : QStringLiteral("cpu"));
+        const auto wanted = qEnvironmentVariable("BEAMER_VIDEO_ENCODER", settings.value("encoding/videoEncoder", defaultEncoder).toString());
+        const int index = videoEncoder->findData(wanted);
         videoEncoder->setCurrentIndex(index >= 0 ? index : 0);
         connect(videoEncoder, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
             QSettings().setValue("encoding/videoEncoder", videoEncoder->currentData());
@@ -411,9 +484,10 @@ private:
     }
     QString selectedVideoEncoder(bool chromecast) const {
         const bool hevc = videoCodec.contains("hevc", Qt::CaseInsensitive) || videoCodec.contains("h265", Qt::CaseInsensitive);
-        const bool nvenc = videoEncoder && videoEncoder->currentData().toString() == "nvenc";
+        const auto enc = videoEncoder ? videoEncoder->currentData().toString() : QStringLiteral("cpu");
         Q_UNUSED(chromecast);
-        if (nvenc) return hevc ? QStringLiteral("hevc_nvenc") : QStringLiteral("h264_nvenc");
+        if (enc == "videotoolbox") return hevc ? QStringLiteral("hevc_videotoolbox") : QStringLiteral("h264_videotoolbox");
+        if (enc == "nvenc") return hevc ? QStringLiteral("hevc_nvenc") : QStringLiteral("h264_nvenc");
         return hevc ? QStringLiteral("libx265") : QStringLiteral("libx264");
     }
     void setReceiverVolume(int value) {
@@ -421,7 +495,7 @@ private:
         const auto &d = found[row]; if (d.kind == DeviceKind::AppleTV) { if (process && process->state() == QProcess::Running) process->write("volume " + QByteArray::number(value / 100.0, 'f', 3) + "\n"); return; }
         if (volumeProcess) { volumeProcess->kill(); volumeProcess->deleteLater(); }
         volumeProcess = new QProcess(this);
-        const auto helper = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
+        const auto helper = resolveBackendPath("backends/beamer-chromecast", "BEAMER_CHROMECAST");
         connect(volumeProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) { if (code != 0) debug(tr("FAIL volume: %1").arg(QString::fromLocal8Bit(volumeProcess->readAllStandardError()).trimmed())); volumeProcess->deleteLater(); volumeProcess = nullptr; });
         volumeProcess->start(helper, {"volume", d.address.toString(), QString::number(value / 100.0, 'f', 2)});
     }
@@ -447,10 +521,31 @@ private:
         QElapsedTimer timer; timer.start(); QTcpSocket baseline; baseline.connectToHost(d.address, port);
         if (baseline.waitForConnected(3000)) { debug(tr("PASS network: TCP %1 connected in %2 ms").arg(port).arg(timer.elapsed())); baseline.disconnectFromHost(); }
         else debug(tr("FAIL network: TCP %1 connection failed after %2 ms: %3").arg(port).arg(timer.elapsed()).arg(baseline.errorString()));
-        const auto executable = d.kind == DeviceKind::AppleTV ? qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry")) : qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
-        const auto command = d.kind == DeviceKind::AppleTV ? QStringList{"probe", d.address.toString(), "7000"} : QStringList{"probe", d.address.toString()};
-        auto *p = new QProcess(this); connect(p, &QProcess::finished, this, [this, p](int code, QProcess::ExitStatus) { const auto out = QString::fromLocal8Bit(p->readAllStandardOutput()).trimmed(); const auto err = QString::fromLocal8Bit(p->readAllStandardError()).trimmed(); debug((code == 0 ? tr("PASS device: ") : tr("FAIL device: ")) + (out.isEmpty() ? err : out)); p->deleteLater(); });
-        p->start(executable, command); if (!p->waitForStarted(1000)) { debug(tr("FAIL device: backend unavailable: %1").arg(executable)); p->deleteLater(); }
+        const auto executable = d.kind == DeviceKind::AppleTV ? resolveBackendPath("backends/airfry", "BEAMER_AIRFRY") : resolveBackendPath("backends/beamer-chromecast", "BEAMER_CHROMECAST");
+        if (QFileInfo::exists(executable)) {
+            const auto command = d.kind == DeviceKind::AppleTV ? QStringList{"probe", d.address.toString(), "7000"} : QStringList{"probe", d.address.toString()};
+            auto *p = new QProcess(this); connect(p, &QProcess::finished, this, [this, p](int code, QProcess::ExitStatus) { const auto out = QString::fromLocal8Bit(p->readAllStandardOutput()).trimmed(); const auto err = QString::fromLocal8Bit(p->readAllStandardError()).trimmed(); debug((code == 0 ? tr("PASS device: ") : tr("FAIL device: ")) + (out.isEmpty() ? err : out)); p->deleteLater(); });
+            p->start(executable, command); if (!p->waitForStarted(1000)) { debug(tr("FAIL device: backend unavailable: %1").arg(executable)); p->deleteLater(); }
+        } else if (d.kind == DeviceKind::AppleTV) {
+            const auto script = resolveBackendPath("backends/pyatv_bridge.py");
+            if (QFileInfo::exists(script)) {
+                auto *p = new QProcess(this);
+                connect(p, &QProcess::finished, this, [this, p](int, QProcess::ExitStatus) {
+                    const auto out = QString::fromLocal8Bit(p->readAllStandardOutput()).trimmed();
+                    const auto obj = QJsonDocument::fromJson(out.toUtf8()).object();
+                    if (obj.value("ok").toBool()) debug(tr("PASS device: %1").arg(obj.value("info").toString()));
+                    else debug(tr("FAIL device: %1").arg(obj.value("error").toString()));
+                    p->deleteLater();
+                });
+                p->start(qEnvironmentVariable("BEAMER_PYTHON", "python3"), {script});
+                p->write(QJsonDocument(QJsonObject{{"command", "probe"}, {"address", d.address.toString()}}).toJson(QJsonDocument::Compact) + '\n');
+                p->closeWriteChannel();
+            } else {
+                debug(tr("FAIL device: backend unavailable: %1").arg(executable));
+            }
+        } else {
+            debug(tr("FAIL device: backend unavailable: %1").arg(executable));
+        }
     }
     void selectFile(const QString &path) {
         videoCodec.clear(); videoPixelFormat.clear(); videoProfile.clear(); audioCodec.clear(); subtitleCodec.clear(); subtitleCodecs.clear();
@@ -584,26 +679,54 @@ private:
 
     void checkPairStatus(int row) {
         if (row < 0 || row >= found.size()) return;
-        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
-        if (!QFileInfo::exists(airfry)) return;
-        auto *check = new QProcess(this);
-        connect(check, &QProcess::finished, this, [this, check, row](int, QProcess::ExitStatus) {
-            if (row < deviceList->count() && row < found.size()) {
-                const bool paired = QString::fromLocal8Bit(check->readAllStandardOutput()).trimmed() == "paired";
-                if (auto *container = deviceList->itemWidget(deviceList->item(row))) {
-                    const auto labels = container->findChildren<QLabel*>(); const auto buttons = container->findChildren<QPushButton*>();
-                    if (!labels.isEmpty()) labels.first()->setText(found[row].name + (paired ? tr("  (Paired)") : tr("  (Needs pairing)")));
-                    if (!buttons.isEmpty()) {
-                        buttons.first()->setText(paired ? tr("Re-pair") : tr("Pair"));
-                        buttons.first()->setEnabled(true);
-                        buttons.first()->setVisible(true);
+        const auto airfry = resolveBackendPath("backends/airfry", "BEAMER_AIRFRY");
+        if (QFileInfo::exists(airfry)) {
+            auto *check = new QProcess(this);
+            connect(check, &QProcess::finished, this, [this, check, row](int, QProcess::ExitStatus) {
+                if (row < deviceList->count() && row < found.size()) {
+                    const auto out = QString::fromLocal8Bit(check->readAllStandardOutput()).trimmed();
+                    const bool paired = out == "paired" || out.contains("\"paired\":true") || out.contains("\"paired\": true");
+                    if (auto *container = deviceList->itemWidget(deviceList->item(row))) {
+                        const auto labels = container->findChildren<QLabel*>(); const auto buttons = container->findChildren<QPushButton*>();
+                        if (!labels.isEmpty()) labels.first()->setText(found[row].name + (paired ? tr("  (Paired)") : tr("  (Needs pairing)")));
+                        if (!buttons.isEmpty()) {
+                            buttons.first()->setText(paired ? tr("Re-pair") : tr("Pair"));
+                            buttons.first()->setEnabled(true);
+                            buttons.first()->setVisible(true);
+                        }
+                        resetPairing->setVisible(paired && row == deviceList->currentRow() && found[row].kind == DeviceKind::AppleTV);
                     }
-                    resetPairing->setVisible(paired && row == deviceList->currentRow() && found[row].kind == DeviceKind::AppleTV);
                 }
-            }
-            check->deleteLater();
-        });
-        check->start(airfry, {"credentials-check", found[row].address.toString()});
+                check->deleteLater();
+            });
+            check->start(airfry, {"credentials-check", found[row].address.toString()});
+            return;
+        }
+        const auto script = resolveBackendPath("backends/pyatv_bridge.py");
+        if (QFileInfo::exists(script)) {
+            auto *check = new QProcess(this);
+            connect(check, &QProcess::finished, this, [this, check, row](int, QProcess::ExitStatus) {
+                if (row < deviceList->count() && row < found.size()) {
+                    const auto out = QString::fromLocal8Bit(check->readAllStandardOutput()).trimmed();
+                    const auto obj = QJsonDocument::fromJson(out.toUtf8()).object();
+                    const bool paired = obj.value("paired").toBool();
+                    if (auto *container = deviceList->itemWidget(deviceList->item(row))) {
+                        const auto labels = container->findChildren<QLabel*>(); const auto buttons = container->findChildren<QPushButton*>();
+                        if (!labels.isEmpty()) labels.first()->setText(found[row].name + (paired ? tr("  (Paired)") : tr("  (Needs pairing)")));
+                        if (!buttons.isEmpty()) {
+                            buttons.first()->setText(paired ? tr("Re-pair") : tr("Pair"));
+                            buttons.first()->setEnabled(true);
+                            buttons.first()->setVisible(true);
+                        }
+                        resetPairing->setVisible(paired && row == deviceList->currentRow() && found[row].kind == DeviceKind::AppleTV);
+                    }
+                }
+                check->deleteLater();
+            });
+            check->start(qEnvironmentVariable("BEAMER_PYTHON", "python3"), {script});
+            check->write(QJsonDocument(QJsonObject{{"command", "credentials-check"}, {"address", found[row].address.toString()}}).toJson(QJsonDocument::Compact) + '\n');
+            check->closeWriteChannel();
+        }
     }
 
     void scanLocalAirplayHosts() {
@@ -616,8 +739,14 @@ private:
             // adapters can report IsUp while their link is unknown/down;
             // require an operational interface for subnet probing.
             const auto name = interface.name().toLower();
-            const bool virtualAdapter = name.startsWith("vmnet") || name.startsWith("tun") || name.startsWith("tap") || name.startsWith("virbr") || name.startsWith("docker") || name.startsWith("br-");
-            if (!(interface.flags() & QNetworkInterface::IsUp) || !(interface.flags() & QNetworkInterface::IsRunning) || (interface.flags() & QNetworkInterface::IsLoopBack) || virtualAdapter || (interface.type() != QNetworkInterface::Wifi && interface.type() != QNetworkInterface::Ethernet)) {
+            const bool virtualAdapter = name.startsWith("vmnet") || name.startsWith("tun") || name.startsWith("tap")
+                || name.startsWith("virbr") || name.startsWith("docker") || name.startsWith("br-")
+                || name.startsWith("utun") || name.startsWith("bridge") || name.startsWith("awdl")
+                || name.startsWith("llw") || name.startsWith("nan") || name.startsWith("gif")
+                || name.startsWith("stf") || name.startsWith("anpi") || name.startsWith("vboxnet");
+            if (!(interface.flags() & QNetworkInterface::IsUp) || !(interface.flags() & QNetworkInterface::IsRunning)
+                || (interface.flags() & QNetworkInterface::IsLoopBack) || virtualAdapter
+                || (interface.type() != QNetworkInterface::Wifi && interface.type() != QNetworkInterface::Ethernet && interface.type() != QNetworkInterface::Unknown)) {
                 debug(tr("DISCOVERY skip interface %1 (inactive, virtual, loopback, or unsupported type)").arg(interface.name()));
                 continue;
             }
@@ -680,7 +809,7 @@ private:
     }
 
     void scanAppleTvs() {
-        const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
+        const auto airfry = resolveBackendPath("backends/airfry", "BEAMER_AIRFRY");
         if (QFileInfo::exists(airfry)) {
             auto *scan = new QProcess(this);
             connect(scan, &QProcess::finished, this, [this, scan](int code, QProcess::ExitStatus) {
@@ -695,7 +824,7 @@ private:
             });
             scan->start(airfry, {"discover-json"}); return;
         }
-        const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
+        const auto script = resolveBackendPath("backends/pyatv_bridge.py");
         if (!QFileInfo::exists(script)) { scanLocalAirplayHosts(); return; }
         auto *scan = new QProcess(this);
         connect(scan, &QProcess::finished, this, [this, scan](int code, QProcess::ExitStatus) {
@@ -772,7 +901,7 @@ private:
         clockBaseSeconds = seekSeconds >= 0.0 ? seekSeconds : 0.0;
         playbackClock.start();
         if (device.kind != DeviceKind::Chromecast) {
-            const auto airfry = qEnvironmentVariable("BEAMER_AIRFRY", QDir(QCoreApplication::applicationDirPath()).filePath("backends/airfry"));
+            const auto airfry = resolveBackendPath("backends/airfry", "BEAMER_AIRFRY");
             if (QFileInfo::exists(airfry)) {
                 if (!process) process = new QProcess(this);
                 if (process->state() != QProcess::NotRunning) {
@@ -835,7 +964,7 @@ private:
                 }
                 statusBar()->showMessage(tr("AirPlay backend unavailable: %1").arg(process->errorString()));
             }
-            const auto script = QDir(QCoreApplication::applicationDirPath()).filePath("backends/pyatv_bridge.py");
+            const auto script = resolveBackendPath("backends/pyatv_bridge.py");
             if (!QFileInfo::exists(script)) { statusBar()->showMessage(tr("Apple TV backend is not installed")); return; }
             auto *atv = new QProcess(this);
             connect(atv, &QProcess::finished, this, [this, atv](int, QProcess::ExitStatus) {
@@ -851,7 +980,7 @@ private:
         }
         if (!process) process = new QProcess(this);
         const auto url = server->mediaUrl(device.address).toString();
-        const auto nativeCast = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
+        const auto nativeCast = resolveBackendPath("backends/beamer-chromecast", "BEAMER_CHROMECAST");
         const auto executable = QFileInfo::exists(nativeCast) ? nativeCast : QStringLiteral("catt");
         const auto args = executable == nativeCast ? QStringList{"cast", device.address.toString(), url} : QStringList{"-d", device.address.toString(), "cast", url};
         connect(process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
@@ -884,7 +1013,7 @@ private:
     void seekTo(double seconds) {
         if (found.isEmpty() || !process) return;
         if (found[deviceList->currentRow()].kind == DeviceKind::Chromecast) {
-            const auto helper = qEnvironmentVariable("BEAMER_CHROMECAST", QDir(QCoreApplication::applicationDirPath()).filePath("backends/beamer-chromecast"));
+            const auto helper = resolveBackendPath("backends/beamer-chromecast", "BEAMER_CHROMECAST");
             auto *seek = new QProcess(this); connect(seek, &QProcess::finished, seek, &QObject::deleteLater);
             seek->start(helper, {"seek", found[deviceList->currentRow()].address.toString(), QString::number(seconds, 'f', 3)});
             elapsedSeconds = seconds; clockBaseSeconds = seconds; playbackClock.start(); return;
