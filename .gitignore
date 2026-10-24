@@ -26,3 +26,4 @@ CMakeUserPresets.json
 /third_party/airfry/rust/fpemu/fp_blob.bin
 /third_party/chromecast/target/
 third_party/.DS_Store
+.DS_Store
