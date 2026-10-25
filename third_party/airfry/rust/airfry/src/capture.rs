@@ -288,7 +288,7 @@ impl CaptureSource {
             }
             *eos_thread.lock().unwrap() = true;
         });
-        crate::dlog!("[CAPTURE] file mode={} encoder={} codec={} pix_fmt={} b_frames={} source={}x{}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, if use_nvenc { "h264_nvenc" } else if direct_h264 { "copy" } else { "libx264" }, codec, pix_fmt, has_b_frames, width, height);
+        crate::dlog!("[CAPTURE] file mode={} encoder={} codec={} pix_fmt={} b_frames={} source={}x{} fps={source_fps:.3}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, if use_nvenc { "h264_nvenc" } else if direct_h264 { "copy" } else { "libx264" }, codec, pix_fmt, has_b_frames, width, height);
         Ok(CaptureSource { pipeline: gst::Pipeline::new(), rx, leftover: Vec::new(), _portal: None, eos, live_fit: None, child: Some(child) })
     }
 

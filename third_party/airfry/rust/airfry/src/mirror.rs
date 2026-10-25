@@ -41,6 +41,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
+use plist::Value;
 use sha2::{Digest, Sha512};
 
 use crate::audio::{self, AudioSecurityMode};
@@ -1060,8 +1061,6 @@ pub fn run_mirror_with_source(
     control_handle: MirrorControl,
     source: Option<Box<dyn FrameSource>>,
 ) -> Result<()> {
-    use plist::Value;
-
     let stop = control_handle.stop.clone();
     // Seed the runtime mute state from the startup --mute flag so a controller
     // that reads is_muted() / toggles from a known baseline behaves correctly.
@@ -1293,12 +1292,23 @@ pub fn run_mirror_with_source(
         }
     }
 
-    audio_setup.insert(
-        "streams".into(),
-        Value::Array(vec![Value::Dictionary(audio_stream_desc)]),
-    );
+    // AirPlay 2 establishes the session and timing/event channel before it
+    // negotiates individual streams. A combined session+audio SETUP is rejected
+    // by current tvOS with HTTP 400 after its NTP probes.
+    let (base_body, audio_body) = audio_setup_bodies(audio_setup, audio_stream_desc)?;
+    let base_resp = control
+        .lock()
+        .unwrap()
+        .request(
+            "SETUP",
+            &audio_uri,
+            "application/x-apple-binary-plist",
+            &base_body,
+            &[],
+        )
+        .context("SETUP base session")?;
+    let base_resp_plist = parse_plist(&base_resp.body).ok();
 
-    let audio_body = marshal_plist(&Value::Dictionary(audio_setup))?;
     let audio_resp = control
         .lock()
         .unwrap()
@@ -1309,7 +1319,7 @@ pub fn run_mirror_with_source(
             &audio_body,
             &[],
         )
-        .context("SETUP phase 1 (audio)")?;
+        .context("SETUP audio stream")?;
     let audio_resp_plist = parse_plist(&audio_resp.body).ok();
 
     // Parse the audio data + control ports (type=96 stream) from the response.
@@ -1325,13 +1335,22 @@ pub fn run_mirror_with_source(
 
     // The receiver advertises its own event port in the SETUP response; the
     // sender dials back to it (mirror.go:336-346).
-    let mut receiver_event_port: u16 = audio_resp_plist
+    let mut receiver_event_port: u16 = base_resp_plist
         .as_ref()
         .and_then(|p| p.as_dictionary())
         .and_then(|d| d.get("eventPort"))
         .and_then(plist_int)
         .filter(|p| *p > 0)
         .map(|p| p as u16)
+        .or_else(|| {
+            audio_resp_plist
+                .as_ref()
+                .and_then(|p| p.as_dictionary())
+                .and_then(|d| d.get("eventPort"))
+                .and_then(plist_int)
+                .filter(|p| *p > 0)
+                .map(|p| p as u16)
+        })
         .unwrap_or(0);
 
     // ---- Phase 2: video SETUP ----
@@ -2119,7 +2138,7 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn decrypt_event_channel(mut conn: TcpStream, secret: Vec<u8>, stop: Arc<AtomicBool>) {
+pub(crate) fn decrypt_event_channel(mut conn: TcpStream, secret: Vec<u8>, stop: Arc<AtomicBool>) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
     let derive = |salt: &[u8], info: &[u8]| -> [u8; 32] {
         let hk = Hkdf::<Sha512>::new(Some(salt), &secret);
@@ -2356,7 +2375,7 @@ fn stream_frames(
                 codec_sent = false;
                 frame_count += 1;
                 if frame_count <= 5 || frame_count % 150 == 0 {
-                    crate::dlog!("[mirror] sent video frame {frame_count} (len={sent_len})");
+                    crate::dlog!("[mirror] sent video frame {frame_count} (len={sent_len}, wall_ms={})", boot_origin().elapsed().as_millis());
                 }
                 Ok(())
             })();
@@ -2524,7 +2543,7 @@ impl CongestionController {
 // NTP timing responder (mirror.go ntpTimingResponder)
 // ---------------------------------------------------------------------------
 
-fn ntp_timing_responder(sock: std::net::UdpSocket, stop: Arc<AtomicBool>) {
+pub(crate) fn ntp_timing_responder(sock: std::net::UdpSocket, stop: Arc<AtomicBool>) {
     sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
     let mut buf = [0u8; 128];
     loop {
@@ -2562,6 +2581,20 @@ fn ntp_timing_responder(sock: std::net::UdpSocket, stop: Arc<AtomicBool>) {
 // ---------------------------------------------------------------------------
 // plist helpers + small utilities
 // ---------------------------------------------------------------------------
+
+fn audio_setup_bodies(
+    base_setup: plist::Dictionary,
+    audio_stream_desc: plist::Dictionary,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let base = marshal_plist(&Value::Dictionary(base_setup))?;
+    let mut stream_setup = plist::Dictionary::new();
+    stream_setup.insert(
+        "streams".into(),
+        Value::Array(vec![Value::Dictionary(audio_stream_desc)]),
+    );
+    let audio = marshal_plist(&Value::Dictionary(stream_setup))?;
+    Ok((base, audio))
+}
 
 fn marshal_plist(v: &plist::Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -2611,6 +2644,35 @@ fn now_unix_nanos() -> u64 {
 #[cfg(test)]
 mod mirror_feature_tests {
     use super::*;
+
+    #[test]
+    fn audio_setup_sends_session_before_stream() {
+        let mut base = plist::Dictionary::new();
+        base.insert("sessionUUID".into(), Value::String("test-session".into()));
+        base.insert("timingProtocol".into(), Value::String("NTP".into()));
+        base.insert("timingPort".into(), Value::Integer(1234i64.into()));
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), Value::Integer(96i64.into()));
+
+        let (base_body, audio_body) = audio_setup_bodies(base, stream).unwrap();
+        let base = parse_plist(&base_body).unwrap();
+        let audio = parse_plist(&audio_body).unwrap();
+        let base = base.as_dictionary().unwrap();
+        let audio = audio.as_dictionary().unwrap();
+        assert!(base.contains_key("sessionUUID"));
+        assert!(base.contains_key("timingProtocol"));
+        assert!(base.contains_key("timingPort"));
+        assert!(!base.contains_key("streams"));
+        assert_eq!(audio.len(), 1);
+        assert!(!audio.contains_key("sessionUUID"));
+        assert!(!audio.contains_key("timingPort"));
+        let streams = audio.get("streams").unwrap().as_array().unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            streams[0].as_dictionary().unwrap().get("type").and_then(plist_int),
+            Some(96)
+        );
+    }
 
     #[test]
     fn parse_port_range_empty_is_none() {

@@ -40,6 +40,7 @@
 #include "device.h"
 #include "media_server.h"
 #include "media_preparer.h"
+#include "bonjour_discovery.h"
 #include <functional>
 
 class DropZone final : public QFrame {
@@ -293,7 +294,18 @@ public:
             if (process && process->state() == QProcess::Running) {
                 if (deviceList->currentRow() >= 0 && deviceList->currentRow() < found.size() && found[deviceList->currentRow()].kind == DeviceKind::AppleTV) {
                     const bool nextPaused = !paused;
+                    if (qEnvironmentVariableIsSet("BEAMER_DIRECT_MEDIA")) {
+                        process->write(nextPaused ? "pause\n" : "resume\n");
+                        if (nextPaused) { clockBaseSeconds = elapsedSeconds; playbackClock.invalidate(); }
+                        else playbackClock.start();
+                        paused = nextPaused;
+                        pause->setText(paused ? tr("Resume") : tr("Pause"));
+                        statusBar()->showMessage(paused ? tr("Playback paused") : tr("Playback resumed"));
+                        return;
+                    }
                     if (nextPaused) {
+                        if (playbackClock.isValid())
+                            elapsedSeconds = clockBaseSeconds + playbackClock.elapsed() / 1000.0;
                         process->write("pause\n");
                         clockBaseSeconds = elapsedSeconds;
                         playbackClock.invalidate();
@@ -442,20 +454,27 @@ private:
             const auto env = qEnvironmentVariable(envVar.toUtf8()).trimmed();
             if (!env.isEmpty()) return env;
         }
-        const auto appDir = QDir(QCoreApplication::applicationDirPath());
-        const QString direct = appDir.filePath(relativeSubpath);
-        if (QFileInfo::exists(direct)) return direct;
-#ifdef Q_OS_MACOS
-        const QString bundleRes = appDir.filePath("../Resources/" + relativeSubpath);
-        if (QFileInfo::exists(bundleRes)) return bundleRes;
-        const QString bundleParent = appDir.filePath("../../" + relativeSubpath);
-        if (QFileInfo::exists(bundleParent)) return bundleParent;
-        const QString bundleTop = appDir.filePath("../../../" + relativeSubpath);
-        if (QFileInfo::exists(bundleTop)) return bundleTop;
+        QStringList subpaths{relativeSubpath};
+#ifdef Q_OS_WIN
+        if (!relativeSubpath.endsWith(".py", Qt::CaseInsensitive) && !relativeSubpath.endsWith(".exe", Qt::CaseInsensitive))
+            subpaths.prepend(relativeSubpath + ".exe");
 #endif
-        const QString cwd = QDir::current().filePath(relativeSubpath);
-        if (QFileInfo::exists(cwd)) return cwd;
-        return direct;
+        const auto firstExisting = [&subpaths](const QDir &base, const QString &prefix = {}) {
+            for (const auto &subpath : subpaths) {
+                const auto candidate = base.filePath(prefix + subpath);
+                if (QFileInfo::exists(candidate)) return candidate;
+            }
+            return QString();
+        };
+        const auto appDir = QDir(QCoreApplication::applicationDirPath());
+        if (const auto direct = firstExisting(appDir); !direct.isEmpty()) return direct;
+#ifdef Q_OS_MACOS
+        if (const auto bundleRes = firstExisting(appDir, "../Resources/"); !bundleRes.isEmpty()) return bundleRes;
+        if (const auto bundleParent = firstExisting(appDir, "../../"); !bundleParent.isEmpty()) return bundleParent;
+        if (const auto bundleTop = firstExisting(appDir, "../../../"); !bundleTop.isEmpty()) return bundleTop;
+#endif
+        if (const auto cwd = firstExisting(QDir::current()); !cwd.isEmpty()) return cwd;
+        return appDir.filePath(subpaths.first());
     }
 
     static double jsonNumber(const QJsonValue &value) {
@@ -557,7 +576,13 @@ private:
         elapsedSeconds = 0;
         progress->setValue(0); progress->setEnabled(true);
         inspectTracks(path);
-        if (!server) server = new MediaServer(this);
+        if (!server) {
+            server = new MediaServer(this);
+            connect(server, &MediaServer::mediaRequestReceived, this, [this](const QHostAddress &peer) {
+                if (qEnvironmentVariableIsSet("BEAMER_DIRECT_MEDIA"))
+                    debug(tr("INFO direct media HTTP request from %1").arg(peer.toString()));
+            });
+        }
         if (!server->isListening() && !server->serve(path)) {
             statusBar()->showMessage(tr("Could not start local media server"));
             return;
@@ -613,6 +638,8 @@ private:
         durationProbe->start(qEnvironmentVariable("BEAMER_FFPROBE", "ffprobe"), {"-v", "quiet", "-print_format", "json", "-show_entries", "format=duration:stream=duration", path});
     }
     void discover() {
+        delete bonjourBrowser;
+        bonjourBrowser = nullptr;
         found.clear(); deviceList->clear(); deviceList->addItem(tr("Searching…"));
         socket = new QUdpSocket(this);
         if (!socket->bind(QHostAddress::AnyIPv4, 0, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
@@ -658,6 +685,44 @@ private:
         const QByteArray request = "M-SEARCH * HTTP/1.1\\r\\nHOST: 239.255.255.250:1900\\r\\n"
             "MAN: \"ssdp:discover\"\\r\\nMX: 2\\r\\nST: ssdp:all\\r\\n\\r\\n";
         socket->writeDatagram(request, QHostAddress("239.255.255.250"), 1900);
+#ifdef BEAMER_HAVE_SYSTEM_DNSSD
+        bonjourBrowser = new BonjourDiscovery(this);
+        if (!bonjourBrowser->startAirPlayBrowse([this](const BonjourDiscovery::Service &service) {
+            if (isLocalHostAddress(service.address)) {
+                debug(tr("DISCOVERY ignoring local Bonjour AirPlay service %1 at %2")
+                          .arg(service.name, service.address.toString()));
+                return;
+            }
+            const auto existing = std::find_if(found.begin(), found.end(), [&service](const auto &d) {
+                return d.address == service.address;
+            });
+            if (existing != found.end()) {
+                const int index = int(std::distance(found.begin(), existing));
+                if (found[index].kind == DeviceKind::AppleTV && !service.name.isEmpty()) {
+                    found[index].name = service.name;
+                    if (auto *container = deviceList->itemWidget(deviceList->item(index))) {
+                        const auto labels = container->findChildren<QLabel *>();
+                        if (!labels.isEmpty()) labels.first()->setText(service.name);
+                    }
+                }
+                return;
+            }
+            Device device;
+            device.id = service.address.toString() + ":" + QString::number(service.port);
+            device.name = service.name.isEmpty() ? tr("Apple TV (%1)").arg(service.address.toString()) : service.name;
+            device.address = service.address;
+            device.kind = DeviceKind::AppleTV;
+            if (found.isEmpty()) deviceList->clear();
+            found.append(device);
+            addDeviceRow(device);
+            debug(tr("DISCOVERY native Bonjour found %1 at %2:%3")
+                      .arg(device.name, device.address.toString()).arg(service.port));
+        })) {
+            debug(tr("DISCOVERY native Bonjour unavailable: %1").arg(bonjourBrowser->errorString()));
+        } else {
+            debug(tr("DISCOVERY browsing _airplay._tcp with system DNS-SD"));
+        }
+#endif
         scanAppleTvs();
         // Native mDNS takes up to five seconds; the bounded TCP fallback
         // needs a few more seconds before reporting that nothing was found.
@@ -816,6 +881,7 @@ private:
                 if (code != 0) { statusBar()->showMessage(tr("Apple TV discovery failed: %1").arg(QString::fromLocal8Bit(scan->readAllStandardError()).trimmed())); scan->deleteLater(); scanLocalAirplayHosts(); return; }
                 for (const auto &value : QJsonDocument::fromJson(scan->readAllStandardOutput()).array()) {
                     const auto object = value.toObject(); Device device; device.id = object.value("id").toString(); device.name = object.value("name").toString(); device.address = QHostAddress(object.value("address").toString()); device.kind = DeviceKind::AppleTV;
+                    if (isLocalHostAddress(device.address)) { debug(tr("DISCOVERY ignoring local AirFry service %1 at %2").arg(device.name, device.address.toString())); continue; }
                     bool duplicate = false; for (const auto &d : found) duplicate |= d.address == device.address;
                     if (!duplicate) { if (found.isEmpty()) deviceList->clear(); found.append(device); addDeviceRow(device); }
                 }
@@ -838,6 +904,7 @@ private:
                 const auto object = value.toObject();
                 Device device; device.id = object.value("id").toString(); device.name = object.value("name").toString();
                 device.address = QHostAddress(object.value("address").toString()); device.kind = DeviceKind::AppleTV;
+                if (isLocalHostAddress(device.address)) { debug(tr("DISCOVERY ignoring local pyatv service %1 at %2").arg(device.name, device.address.toString())); continue; }
                 bool duplicate = false; for (const auto &d : found) duplicate |= d.address == device.address;
                 if (!duplicate) {
                     if (found.isEmpty()) deviceList->clear();
@@ -849,6 +916,9 @@ private:
         });
         const auto python = qEnvironmentVariable("BEAMER_PYTHON", "python3");
         scan->start(python, {script}); scan->write("{\"command\":\"scan\"}\n"); scan->closeWriteChannel();
+    }
+    static bool isLocalHostAddress(const QHostAddress &address) {
+        return address.isLoopback() || QNetworkInterface::allAddresses().contains(address);
     }
     void beam() {
         const int row = deviceList->currentRow();
@@ -863,6 +933,11 @@ private:
         // track-remux below is only needed for Chromecast's HTTP playback;
         // doing it first would add a full-file delay on Apple TV.
         if (found[row].kind == DeviceKind::AppleTV) {
+            if (qEnvironmentVariableIsSet("BEAMER_DIRECT_MEDIA") &&
+                QFileInfo(selectedPath).suffix().compare("mp4", Qt::CaseInsensitive) != 0) {
+                statusBar()->showMessage(tr("Direct media test requires an MP4 file; unset BEAMER_DIRECT_MEDIA to mirror this file"));
+                return;
+            }
             beamNow();
             return;
         }
@@ -940,27 +1015,40 @@ private:
                         QTimer::singleShot(0, this, [this] { beamNow(); });
                     }
                 });
-                // Keep the stable video path isolated while file-audio
-                // negotiation is validated independently.
-                QStringList airplayArgs{"mirror", device.address.toString(), "--file", selectedPath, "--debug"};
+                const bool directMedia = qEnvironmentVariableIsSet("BEAMER_DIRECT_MEDIA");
+                QStringList airplayArgs;
+                if (directMedia) {
+                    const auto mediaUrl = server->mediaUrl(device.address);
+                    if (!mediaUrl.isValid() || mediaUrl.host() == "127.0.0.1") {
+                        statusBar()->showMessage(tr("Direct media needs a reachable local HTTP address"));
+                        return;
+                    }
+                    airplayArgs = {"media", device.address.toString(), "--url", mediaUrl.toString(), "--debug"};
+                    if (seekSeconds >= 0.0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
+                    debug(tr("INFO direct media test: receiver URL %1").arg(mediaUrl.toString()));
+                } else {
+                    airplayArgs = {"mirror", device.address.toString(), "--file", selectedPath, "--debug"};
+                }
                 // AirFry's mirror encoder is independent of FFmpeg's media
                 // preparation encoder.  Explicitly select the matching capture
                 // path instead of silently forcing software encoding.
-                if (videoEncoder && videoEncoder->currentData().toString() == "nvenc")
-                    airplayArgs << "--hwaccel" << "nvenc";
-                else
-                    airplayArgs << "--sw";
-                if (seekSeconds >= 0.0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
+                if (!directMedia) {
+                    if (videoEncoder && videoEncoder->currentData().toString() == "nvenc")
+                        airplayArgs << "--hwaccel" << "nvenc";
+                    else
+                        airplayArgs << "--sw";
+                    if (seekSeconds >= 0.0) airplayArgs << "--start" << QString::number(seekSeconds, 'f', 3);
+                }
                 // File audio is streamed by AirFry alongside the video. Set
                 // BEAMER_NO_AUDIO=1 only when video-only playback is desired.
-                if (qEnvironmentVariableIsSet("BEAMER_NO_AUDIO")) airplayArgs << "--no-audio";
-                if (qEnvironmentVariableIsSet("BEAMER_TEST_AUDIO")) airplayArgs << "--test-audio";
+                if (!directMedia && qEnvironmentVariableIsSet("BEAMER_NO_AUDIO")) airplayArgs << "--no-audio";
+                if (!directMedia && qEnvironmentVariableIsSet("BEAMER_TEST_AUDIO")) airplayArgs << "--test-audio";
                 process->start(airfry, airplayArgs);
                 if (process->waitForStarted(1000)) {
                     // AirFry retains this value if the mirror control channel
                     // is still negotiating, then applies it after SETUP.
                     process->write("volume " + QByteArray::number(volume->value() / 100.0, 'f', 3) + "\n");
-                    paused = false; stopping = false; pause->setText(tr("Pause")); pause->setEnabled(true); playbackTimer->start(250); statusBar()->showMessage(tr("AirPlay session starting on %1…").arg(device.name)); return;
+                    paused = false; stopping = false; pause->setText(tr("Pause")); pause->setEnabled(true); playbackTimer->start(250); statusBar()->showMessage(directMedia ? tr("Testing direct media on %1…").arg(device.name) : tr("AirPlay session starting on %1…").arg(device.name)); return;
                 }
                 statusBar()->showMessage(tr("AirPlay backend unavailable: %1").arg(process->errorString()));
             }
@@ -1046,6 +1134,7 @@ private:
     QList<Device> found;
     QString selectedPath;
     QUdpSocket *socket{};
+    BonjourDiscovery *bonjourBrowser{};
     MediaServer *server{};
     QProcess *process{};
     QProcess *ffmpeg{};

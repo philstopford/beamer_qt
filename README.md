@@ -1,11 +1,12 @@
 # Beamer Qt
 
-Beamer Qt is a desktop application for mirroring local video to Chromecast and Apple TV devices on the LAN, supporting both Intel Linux and Apple Silicon macOS.
+Beamer Qt is a desktop application for mirroring local video to Chromecast and Apple TV devices on the LAN, supporting Linux and macOS with initial Windows support.
 
 ## Platform support
 
 - **Linux (x86_64 / Intel / AMD)**: Full support with native Qt 6, FFmpeg media preparation, local HTTP media streaming, and optional hardware acceleration via NVIDIA NVENC.
-- **macOS (Apple Silicon / arm64 and Intel)**: Native Qt 6 GUI, bundle layout support, FFmpeg media preparation with hardware-accelerated Apple VideoToolbox (`h264_videotoolbox` and `hevc_videotoolbox`), local HTTP streaming, SSDP discovery, and network subnet scan fallback for AirPlay/Chromecast endpoints.
+- **macOS (Apple Silicon / arm64 and Intel)**: Native Qt 6 GUI, bundle layout support, FFmpeg media preparation with hardware-accelerated Apple VideoToolbox (`h264_videotoolbox` and `hevc_videotoolbox`), local HTTP streaming, system Bonjour and SSDP discovery, and network subnet scan fallback for AirPlay/Chromecast endpoints.
+- **Windows 10/11 (experimental)**: The Qt application and native Chromecast helper build with `.exe` packaging. SSDP and subnet discovery are available, and mDNS is enabled when a Bonjour SDK-compatible `dns_sd` library or pyatv is installed. The native AirFry sender is currently Unix-only, so Windows supports Chromecast playback while Apple TV discovery and diagnostics are an initial foundation for a future sender port.
 
 ## How it works
 
@@ -13,7 +14,7 @@ The Qt application discovers Chromecast/DIAL receivers with SSDP and Apple TV re
 
 ### Receiver discovery
 
-Apple TV discovery normally uses mDNS (`_airplay._tcp`). Some mesh WiFi systems do not forward multicast between mesh nodes, so an Apple TV on wired Ethernet may be reachable but absent from mDNS results. The fallback scan covers `/22` through `/30` networks on active physical interfaces and probes the AirPlay TCP endpoint directly. Virtual adapters such as VMware, Docker, bridge, utun, and tunnel interfaces are excluded.
+Apple TV discovery normally uses mDNS (`_airplay._tcp`). Beamer Qt uses the system DNS-SD daemon when available: Bonjour on macOS, Avahi's `libdns_sd` compatibility API on Linux, and a Bonjour SDK-compatible library on Windows. This provides the system's cross-interface view and retains advertised names such as `LivingRoom`. Services that resolve to one of the computer's own addresses are ignored. The portable AirFry mDNS browser runs alongside it where available. Some mesh WiFi systems do not forward multicast between mesh nodes, so an Apple TV on wired Ethernet may still be reachable but absent from mDNS results. The fallback scan covers `/22` through `/30` networks on active physical interfaces and probes the AirPlay TCP endpoint directly. Virtual adapters such as VMware, Docker, bridge, utun, and tunnel interfaces are excluded.
 
 ### Media preparation
 
@@ -66,15 +67,26 @@ open ./build/beamer_qt.app
 ./build/beamer_qt.app/Contents/MacOS/beamer_qt
 ```
 
+On Windows (experimental):
+```powershell
+cmake -S . -B build
+cmake --build build --config Release
+.\build\Release\beamer_qt.exe
+```
+
+For system-integrated discovery on Debian/Ubuntu install `libavahi-compat-libdnssd-dev`; Fedora provides the equivalent Avahi compatibility development package. Windows detects a Bonjour SDK installation exposed through the normal compiler and library search paths; without one, SSDP, the bounded address scan, and optional pyatv discovery remain available.
+
 The native Chromecast helper is expected at `third_party/chromecast/target/debug/beamer-chromecast`. Override it with `BEAMER_CHROMECAST` if it is elsewhere.
 
-The normal CMake build places both native backends beside the executable, so no environment variables are required. Drag a video into the window, select a receiver, and click Beam. For the first Apple TV use, click Pair, wait for the PIN screen, and enter the PIN. Pairing credentials are saved by AirFry.
+The normal Linux/macOS CMake build places both native backends beside the executable, so no environment variables are required. The Windows build packages the Chromecast helper beside the executable. Drag a video into the window, select a receiver, and click Beam. For the first Apple TV use on Linux or macOS, click Pair, wait for the PIN screen, and enter the PIN. Pairing credentials are saved by AirFry.
 
 The computer and receiver must be on reachable LANs. mDNS/SSDP and receiver return connections must not be blocked by the firewall. Mesh WiFi systems sometimes filter multicast between nodes even when wired and wireless clients share an IP subnet; the automatic TCP fallback handles that case when both devices are on the same physical local network. **Add Apple TV by IP…** remains available when the network is routed or uses a subnet outside the bounded automatic scan. The direct path requires TCP port 7000 and the return connections used by AirPlay to be allowed.
 
 ## Troubleshooting
 
-The Apple TV path enables AirFry debug diagnostics; the status bar shows the latest sender message. Discovery details, including interfaces, addresses, prefixes, excluded adapters, scan subnets, and probe counts, appear in the Debug diagnostics panel. If automatic discovery still fails, check that the Apple TV is reachable on TCP port 7000 or use **Add Apple TV by IP…**. Test stable video first. Set `BEAMER_FILE_AUDIO=1` for file audio, or `BEAMER_TEST_AUDIO=1` to use a generated tone.
+The Apple TV path enables AirFry debug diagnostics; the status bar shows the latest sender message. Discovery details, including interfaces, addresses, prefixes, excluded adapters, scan subnets, and probe counts, appear in the Debug diagnostics panel. If automatic discovery still fails, check that the Apple TV is reachable on TCP port 7000 or use **Add Apple TV by IP…**. File audio plays by default; set `BEAMER_NO_AUDIO=1` for video-only playback, or `BEAMER_TEST_AUDIO=1` to use a generated tone.
+
+For an isolated direct-media test, launch Beamer with `BEAMER_DIRECT_MEDIA=1` and select an MP4 file. AirFry asks the Apple TV to fetch and decode the original file, without mirroring or transcoding it. The Debug diagnostics panel logs the media URL, incoming HTTP requests, and receiver playback status or errors. Direct mode is experimental and does not automatically fall back to mirroring; unset the variable to return to the working mirror path. The receiver must support the file's video and audio codecs. Track and subtitle selection are not applied in this mode.
 
 Useful overrides are `BEAMER_PYTHON` (legacy fallback), `BEAMER_AIRFRY`, `BEAMER_FFMPEG`, `BEAMER_FFPROBE`, and `BEAMER_VIDEO_ENCODER`.
 

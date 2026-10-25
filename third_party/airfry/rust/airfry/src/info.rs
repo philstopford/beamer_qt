@@ -192,9 +192,26 @@ fn parse_info(body: &[u8]) -> Result<ReceiverInfo> {
         }
     }
     for key in ["audioFormats", "supportedAudioFormatsExtended"] {
-        if let Some(arr) = dict.get(key).and_then(|v| v.as_array()) {
+        let value = match dict.get(key) { Some(value) => value, None => continue };
+        // Older receivers expose an array of format masks directly. Newer
+        // tvOS uses a dictionary of format *indices*, which is a different
+        // namespace and must not be mixed into audio_formats.
+        let arr = value.as_array();
+        if let Some(arr) = arr {
             for value in arr { if let Some(n) = as_i64(value) { info.audio_formats.push(n); } }
             if !info.audio_formats.is_empty() { break; }
+        }
+    }
+    if info.audio_formats.is_empty() {
+        if let Some(mask) = dict
+            .get("supportedFormats")
+            .and_then(|v| v.as_dictionary())
+            .and_then(|formats| formats.get("audioStream"))
+            .and_then(as_i64)
+        {
+            if mask & 0x40000 != 0 {
+                info.audio_formats.push(0x40000);
+            }
         }
     }
 
@@ -249,5 +266,31 @@ mod tests {
     fn display_size_zero_when_absent() {
         let info = ReceiverInfo::default();
         assert_eq!(info.display_size(), (0, 0));
+    }
+
+    #[test]
+    fn current_tv_os_reads_alac_from_audio_stream_mask() {
+        let mut extended = plist::Dictionary::new();
+        extended.insert(
+            "bufferStream".into(),
+            plist::Value::Array(vec![plist::Value::Integer(19i64.into())]),
+        );
+        let mut supported = plist::Dictionary::new();
+        supported.insert(
+            "audioStream".into(),
+            plist::Value::Integer(0x0144_0800i64.into()),
+        );
+        let mut root = plist::Dictionary::new();
+        root.insert(
+            "supportedAudioFormatsExtended".into(),
+            plist::Value::Dictionary(extended),
+        );
+        root.insert("supportedFormats".into(), plist::Value::Dictionary(supported));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(root)).unwrap();
+
+        let info = parse_info(&body).unwrap();
+        assert_eq!(info.audio_formats, vec![0x40000]);
+        assert!(info.supports_alac());
     }
 }

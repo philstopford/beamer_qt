@@ -93,6 +93,10 @@ impl Transport {
         Ok((pa.ip().to_string(), pa.port()))
     }
 
+    pub fn local_ip(&self) -> Result<String> {
+        Ok(self.conn.local_addr().context("socket local addr")?.ip().to_string())
+    }
+
     /// Enable HAP control-channel encryption with the keys derived from the
     /// pair-verify X25519 shared secret. Nonces reset to 0 (matches Go).
     pub fn enable_encryption(&mut self, write_key: Vec<u8>, read_key: Vec<u8>) {
@@ -115,11 +119,34 @@ impl Transport {
         body: &[u8],
         extra_headers: &[(&str, &str)],
     ) -> Result<Response> {
+        self.request_with_protocol("RTSP/1.0", method, path, content_type, body, extra_headers)
+    }
+
+    pub fn request_http(
+        &mut self,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response> {
+        self.request_with_protocol("HTTP/1.1", method, path, content_type, body, extra_headers)
+    }
+
+    fn request_with_protocol(
+        &mut self,
+        protocol: &str,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response> {
         self.cseq += 1;
         let seq = self.cseq;
 
         let mut buf = Vec::new();
-        write!(buf, "{method} {path} RTSP/1.0\r\n")?;
+        write!(buf, "{method} {path} {protocol}\r\n")?;
         write!(buf, "CSeq: {seq}\r\n")?;
         write!(buf, "User-Agent: {USER_AGENT}\r\n")?;
         for (k, v) in extra_headers {
@@ -133,7 +160,7 @@ impl Transport {
         buf.extend_from_slice(body);
 
         crate::dlog!(
-            "[HTTP] -> {method} {path} (body={} bytes, enc={}, cseq={}) body={}",
+            "[HTTP] -> {method} {path} {protocol} (body={} bytes, enc={}, cseq={}) body={}",
             body.len(),
             self.encrypted,
             seq,
@@ -354,6 +381,7 @@ fn finish_response(
     body: Vec<u8>,
 ) -> Result<Response> {
     if !(200..300).contains(&status) {
+        crate::dlog!("[HTTP] error status {status} headers={headers:?}");
         // Mirror Go's HTTPStatusError, which carries the response body and
         // formats as "HTTP %d (body: %s)" (client.go:78-80). The body bytes have
         // already been drained off the socket by the caller, so socket
@@ -631,6 +659,13 @@ impl Session {
             }
             Err(e) => {
                 progress("info", false, &e.to_string());
+                // A timed-out RTSP request can still have a late response in
+                // the socket. Reusing that connection shifts every following
+                // response by one request (pair-verify reads /info, fp-setup
+                // reads pair-verify, and SETUP fails misleadingly). Start the
+                // pairing exchange on a clean transport.
+                transport = Transport::connect(host, port)
+                    .context("reconnect after failed GET /info")?;
                 ReceiverInfo::default()
             }
         };

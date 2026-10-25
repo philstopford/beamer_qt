@@ -1117,9 +1117,11 @@ pub fn stream_audio(
 
         if frame_count <= 10 || frame_count % 100 == 0 {
             crate::dlog!(
-                "[audio] sent frame {frame_count}: seq={} payload={n} rtp={}",
+                "[audio] sent frame {frame_count}: seq={} payload={n} rtp={} wall_ms={} media_ms={}",
                 frame_seq - 1,
-                next_rtp - spf
+                next_rtp - spf,
+                boot_origin.elapsed().as_millis(),
+                frame_count * spf as u64 * 1000 / AUDIO_SAMPLE_RATE as u64
             );
         }
     }
@@ -1205,6 +1207,25 @@ mod tests {
         let s2 = aead.seal(&nonce, b"", aad);
         assert_eq!(s2.len(), AUDIO_CHACHA_OVERHEAD);
         assert_eq!(aead.open(&nonce, &s2, aad).unwrap(), b"");
+    }
+
+    #[test]
+    fn chacha64_matches_zero_prefixed_ietf() {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+
+        let key = [0x35u8; 32];
+        let nonce64 = [0x12u8; 8];
+        let aad = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11];
+        let plaintext = b"original 64-bit nonce variant";
+        let custom = AudioChaCha64::new(&key).unwrap().seal(&nonce64, plaintext, &aad);
+
+        let mut nonce96 = [0u8; 12];
+        nonce96[4..].copy_from_slice(&nonce64);
+        let ietf = ChaCha20Poly1305::new((&key).into())
+            .encrypt(Nonce::from_slice(&nonce96), Payload { msg: plaintext, aad: &aad })
+            .unwrap();
+        assert_eq!(custom, ietf);
     }
 
     #[test]
