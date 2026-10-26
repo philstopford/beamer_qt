@@ -511,21 +511,40 @@ impl AudioCapture {
     /// `buf`. Returns the encoded length, or 0 at end-of-stream.
     /// Faithful to audio.go ReadFrame (which io.ReadFull's exactly one frame).
     pub fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if !self.fill_pcm_frame()? {
+            return Ok(0);
+        }
+        let need = self.frame_pcm_size();
+        let n = encode_alac_verbatim(buf, &self.pcm[..need], AUDIO_SPF as usize, self.channels, 16);
+        self.pcm.drain(..need);
+        Ok(n)
+    }
+
+    /// Advance a file source without encoding or sending an overdue packet.
+    /// The RTP sample position must advance by the same frame at the call site.
+    fn discard_frame(&mut self) -> Result<bool> {
+        if !self.fill_pcm_frame()? {
+            return Ok(false);
+        }
+        let need = self.frame_pcm_size();
+        self.pcm.drain(..need);
+        Ok(true)
+    }
+
+    fn fill_pcm_frame(&mut self) -> Result<bool> {
         let need = self.frame_pcm_size();
         while self.pcm.len() < need {
             match self.rx.recv() {
                 Ok(chunk) => self.pcm.extend_from_slice(&chunk),
                 Err(_) => {
                     if *self.eos.lock().unwrap() {
-                        return Ok(0);
+                        return Ok(false);
                     }
                     bail!("audio capture ended unexpectedly");
                 }
             }
         }
-        let n = encode_alac_verbatim(buf, &self.pcm[..need], AUDIO_SPF as usize, self.channels, 16);
-        self.pcm.drain(..need);
-        Ok(n)
+        Ok(true)
     }
 
     /// DrainStale — discard whatever PCM backlog accumulated between capture
@@ -1001,6 +1020,7 @@ pub fn stream_audio(
     let mut retransmit_buf: Vec<AudioFrame> = vec![AudioFrame::default(); RETRANSMIT_DEPTH];
     let mut frame_seq: u16 = 1; // first frame = seq 1
     let mut frame_count: u64 = 0;
+    let mut source_frame_count: u64 = 0;
     let mut retransmit_idx = 0usize;
     let mut burst_done = false;
     let mut frame_buf = vec![0u8; 8192];
@@ -1009,6 +1029,10 @@ pub fn stream_audio(
     );
     let mut next_audio_deadline = Instant::now();
     let mut was_paused = false;
+    let mut pause_started: Option<Instant> = None;
+    let mut last_read_time = Duration::ZERO;
+    let mut last_work_time = Duration::ZERO;
+    let mut skipped_frames = 0u64;
 
     // The capture started before video did; drop the stale backlog so audio
     // lines up with video (audio.go DrainStale).
@@ -1027,10 +1051,14 @@ pub fn stream_audio(
         // pause, which causes rapid playback and audio/video drift on resume.
         if paused.load(Ordering::Relaxed) {
             was_paused = true;
+            pause_started.get_or_insert_with(Instant::now);
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
         if was_paused {
+            if let Some(started) = pause_started.take() {
+                next_audio_deadline += started.elapsed();
+            }
             // Both FFmpeg pipes can retain data while the sender is paused,
             // but their buffered durations are not identical. Discard queued
             // PCM before reading the first resumed frame so audio does not
@@ -1039,7 +1067,33 @@ pub fn stream_audio(
                 capture.drain_stale();
             }
         }
+        if capture.file_realtime {
+            // Keep the sample clock tied to the original deadline. Resetting
+            // next_audio_deadline to `now` after an overrun permanently delays
+            // every later sample, which makes audio drift behind video.
+            let late = Instant::now().saturating_duration_since(next_audio_deadline);
+            if late > frame_period * 2 {
+                let overdue_frames = (late.as_nanos() / frame_period.as_nanos()) as u64;
+                for _ in 0..overdue_frames {
+                    if !capture.discard_frame()? {
+                        return Ok(());
+                    }
+                    source_frame_count += 1;
+                    next_rtp = next_rtp.wrapping_add(spf);
+                    next_audio_deadline += frame_period;
+                }
+                skipped_frames += overdue_frames;
+                crate::dlog!("[audio] caught up {overdue_frames} overdue source frames (late_ms={:.1}, last_read_ms={:.1}, last_work_ms={:.1}); media_ms={} wall_ms={}",
+                    late.as_secs_f64() * 1000.0,
+                    last_read_time.as_secs_f64() * 1000.0,
+                    last_work_time.as_secs_f64() * 1000.0,
+                    source_frame_count * spf as u64 * 1000 / AUDIO_SAMPLE_RATE as u64,
+                    boot_origin.elapsed().as_millis());
+            }
+        }
+        let work_start = Instant::now();
         let n = capture.read_frame(&mut frame_buf)?;
+        last_read_time = work_start.elapsed();
         if n == 0 {
             // EOF.
             return Ok(());
@@ -1047,6 +1101,7 @@ pub fn stream_audio(
 
         let payload = frame_buf[..n].to_vec();
         frame_count += 1;
+        source_frame_count += 1;
 
         if was_paused {
             // Re-anchor the receiver after a pause. The receiver may have
@@ -1103,25 +1158,22 @@ pub fn stream_audio(
 
         frame_seq = frame_seq.wrapping_add(1);
         next_rtp = next_rtp.wrapping_add(spf);
+        last_work_time = work_start.elapsed();
         if capture.file_realtime {
             next_audio_deadline += frame_period;
             let now = Instant::now();
             if next_audio_deadline > now {
                 std::thread::sleep(next_audio_deadline - now);
-            } else {
-                // If encoding/networking briefly falls behind, re-anchor
-                // instead of trying to catch up with a burst of packets.
-                next_audio_deadline = now;
             }
         }
 
         if frame_count <= 10 || frame_count % 100 == 0 {
             crate::dlog!(
-                "[audio] sent frame {frame_count}: seq={} payload={n} rtp={} wall_ms={} media_ms={}",
+                "[audio] sent frame {frame_count}: seq={} payload={n} rtp={} wall_ms={} media_ms={} skipped={skipped_frames}",
                 frame_seq - 1,
                 next_rtp - spf,
                 boot_origin.elapsed().as_millis(),
-                frame_count * spf as u64 * 1000 / AUDIO_SAMPLE_RATE as u64
+                source_frame_count * spf as u64 * 1000 / AUDIO_SAMPLE_RATE as u64
             );
         }
     }

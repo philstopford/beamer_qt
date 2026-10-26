@@ -217,7 +217,10 @@ impl CaptureSource {
     /// screen capture and AAC timing.
     fn start_file(file: &str, cfg: &CaptureConfig) -> Result<CaptureSource> {
         let (width, height, source_fps, codec, pix_fmt, has_b_frames) = Self::probe_file_video(file).unwrap_or((1920, 1080, 30.0, String::new(), String::new(), true));
-        let bitrate = if cfg.bitrate_kbps > 0 { cfg.bitrate_kbps } else { (((width as u64 * height as u64 * source_fps.max(1.0) as u64) / 15_000) as u32).clamp(1800, 12_000) };
+        // Ultrafast at ~0.07 bits/pixel/frame visibly blocks during motion.
+        // Allow roughly 0.2 bits/pixel/frame by default; the encoder may use
+        // short bursts above the average target for complex scenes.
+        let bitrate = if cfg.bitrate_kbps > 0 { cfg.bitrate_kbps } else { (((width as f64 * height as f64 * source_fps.max(1.0)) / 5_000.0).round() as u32).clamp(4_000, 40_000) };
         let mut command = Command::new("ffmpeg");
         if cfg.start_seconds > 0.0 {
             command.args(["-ss", &cfg.start_seconds.to_string()]);
@@ -243,7 +246,7 @@ impl CaptureSource {
             if use_nvenc {
                 args.extend(["-preset", "p5", "-tune", "ll"].into_iter().map(String::from));
             } else {
-                args.extend(["-preset", "ultrafast", "-tune", "zerolatency"].into_iter().map(String::from));
+                args.extend(["-preset", "superfast", "-tune", "zerolatency"].into_iter().map(String::from));
             }
             if use_nvenc {
                 // Keep decoded CUDA frames on the GPU and perform the format
@@ -256,8 +259,8 @@ impl CaptureSource {
             args.extend([
                 "-fps_mode", "cfr", "-r", &format!("{source_fps:.3}"),
                 "-b:v", &format!("{}k", bitrate),
-                "-maxrate", &format!("{}k", bitrate),
-                "-bufsize", &format!("{}k", bitrate.saturating_mul(2)),
+                "-maxrate", &format!("{}k", bitrate.saturating_mul(3) / 2),
+                "-bufsize", &format!("{}k", bitrate.saturating_mul(3)),
                 "-f", "h264", "pipe:1",
             ].into_iter().map(String::from));
             args
@@ -288,7 +291,7 @@ impl CaptureSource {
             }
             *eos_thread.lock().unwrap() = true;
         });
-        crate::dlog!("[CAPTURE] file mode={} encoder={} codec={} pix_fmt={} b_frames={} source={}x{} fps={source_fps:.3}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, if use_nvenc { "h264_nvenc" } else if direct_h264 { "copy" } else { "libx264" }, codec, pix_fmt, has_b_frames, width, height);
+        crate::dlog!("[CAPTURE] file mode={} encoder={} bitrate={}kbps codec={} pix_fmt={} b_frames={} source={}x{} fps={source_fps:.3}", if direct_h264 { "direct-h264" } else { "transcoded-h264" }, if use_nvenc { "h264_nvenc" } else if direct_h264 { "copy" } else { "libx264" }, bitrate, codec, pix_fmt, has_b_frames, width, height);
         Ok(CaptureSource { pipeline: gst::Pipeline::new(), rx, leftover: Vec::new(), _portal: None, eos, live_fit: None, child: Some(child) })
     }
 
