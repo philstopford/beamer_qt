@@ -9,6 +9,12 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 
 qt_add_executable(beamer_qt main.cpp device.cpp media_server.cpp media_preparer.cpp bonjour_discovery.cpp)
 target_link_libraries(beamer_qt PRIVATE Qt6::Widgets Qt6::Network)
+qt_add_resources(beamer_qt "beamer_icons" PREFIX "/" FILES assets/beamer-icon.png)
+
+if(WIN32)
+    target_sources(beamer_qt PRIVATE assets/beamer-icon.rc)
+    target_include_directories(beamer_qt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+endif()
 
 # Prefer the platform DNS-SD daemon so discovery benefits from its interface
 # handling and cache. macOS supplies this API in libSystem. Linux commonly
@@ -98,9 +104,19 @@ if(APPLE)
         MACOSX_BUNDLE_BUNDLE_NAME "Beamer Qt"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.beamer.beamer-qt"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+        MACOSX_BUNDLE_ICON_FILE "beamer-icon.icns"
     )
+    set_source_files_properties(assets/beamer-icon.icns PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+    target_sources(beamer_qt PRIVATE assets/beamer-icon.icns)
 else()
     set_target_properties(beamer_qt PROPERTIES
         WIN32_EXECUTABLE TRUE
     )
+endif()
+
+if(UNIX AND NOT APPLE)
+    include(GNUInstallDirs)
+    install(TARGETS beamer_qt RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(FILES assets/beamer-qt.desktop DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
+    install(FILES assets/beamer-icon.png DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/512x512/apps" RENAME beamer-qt.png)
 endif()

@@ -53,6 +53,8 @@ ctest --test-dir build --output-on-failure
 
 When Cargo is installed, CMake will automatically build the native helpers in `third_party/`.
 
+The projector icon is included automatically: the macOS `.app` contains an ICNS icon, the Windows `.exe` embeds an ICO icon, and Qt embeds a PNG for the application window on every platform. On Linux, `cmake --install build` also installs a desktop entry and a 512-pixel icon. The editable source is `assets/beamer-icon.svg`; run `python3 assets/generate-icons.py` with `rsvg-convert` installed to regenerate the platform files after editing it.
+
 ## Run
 
 On Linux:

@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QIcon>
 #include <QComboBox>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -1157,6 +1158,7 @@ private:
 
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    app.setWindowIcon(QIcon(":/assets/beamer-icon.png"));
     QApplication::setApplicationName("Beamer Qt");
     MainWindow window;
     window.show();

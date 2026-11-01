@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Beamer Qt
+Comment=Play local video on Apple TV and Chromecast
+Exec=beamer_qt
+Icon=beamer-qt
+Categories=AudioVideo;Video;Player;
+Terminal=false
